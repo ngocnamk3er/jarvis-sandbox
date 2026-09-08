@@ -70,7 +70,9 @@ def _prepare(thread_id: str) -> tuple[Path, Path, int]:
     for p in (root, ws):
         with contextlib.suppress(OSError):
             os.chown(p, uid, uid)
-    (root / _MARKER).touch()
+            os.chmod(p, 0o700)     # 0700 — DATA_ROOT is traversable (0711), so
+                                   # another thread's uid must get nothing here
+    (root / _MARKER).touch()       # root creates it fine even in a 0700 dir
     return root, ws, uid
 
 
@@ -86,11 +88,16 @@ def _truncate(b: bytes) -> str:
     return text
 
 
-# The command runs: in a private mount namespace, with the thread's own
-# workspace bind-mounted onto /workspace, dropped to the thread's uid.
-# `mount` needs CAP_SYS_ADMIN so it happens before setpriv drops privileges.
+# The command runs in a private mount namespace:
+#   1. bind the thread's own workspace onto /workspace
+#   2. mask DATA_ROOT entirely (a tmpfs with mode 000) so the real
+#      /data/<other_thread>/... paths simply don't exist for the command
+#   3. drop to the thread's uid and run
+# `mount` needs CAP_SYS_ADMIN, so it all happens before setpriv drops privs.
 _JAIL = (
-    'mkdir -p /workspace && mount --bind "$SBX_WS" /workspace && cd /workspace && '
+    'mkdir -p /workspace && mount --bind "$SBX_WS" /workspace && '
+    'mount -t tmpfs -o mode=000,size=1M tmpfs "$SBX_DATA" && '
+    'cd /workspace && '
     'exec setpriv --reuid "$SBX_UID" --regid "$SBX_UID" --clear-groups '
     '     --inh-caps=-all bash -c "$SBX_CMD"'
 )
@@ -104,6 +111,7 @@ async def exec_command(thread_id: str, command: str, timeout_seconds: int) -> di
         cwd="/",
         env={
             "SBX_WS": str(ws),
+            "SBX_DATA": settings.DATA_ROOT,
             "SBX_UID": str(uid),
             "SBX_CMD": command,          # only ever reaches `bash -c "$SBX_CMD"`
             "HOME": "/workspace",
