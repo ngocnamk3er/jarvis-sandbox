@@ -11,9 +11,16 @@ class Settings(BaseSettings):
     # header check is enough. Same posture as jarvis-conversation-service.
     INTERNAL_API_KEY: str = ""
 
-    WORKSPACE_ROOT: str = "/workspace"
+    # emptyDir mount. Each conversation gets DATA_ROOT/<thread_id>/ (its
+    # "prefix"), and DATA_ROOT/<thread_id>/workspace/ is bind-mounted to
+    # /workspace inside a per-exec mount namespace — so the agent only ever
+    # sees /workspace and can't reach a sibling thread's tree.
+    DATA_ROOT: str = "/data"
     COMMAND_TIMEOUT_SECONDS: int = 300
     IDLE_GC_MINUTES: int = 60
+    # per-thread uid range for setpriv (belt-and-braces alongside the mount ns)
+    UID_BASE: int = 20000
+    UID_RANGE: int = 40000
 
     class Config:
         env_file = ".env"

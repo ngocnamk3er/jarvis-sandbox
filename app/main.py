@@ -11,7 +11,11 @@ from app.services import runner
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    Path(settings.WORKSPACE_ROOT).mkdir(parents=True, exist_ok=True)
+    root = Path(settings.DATA_ROOT)
+    root.mkdir(parents=True, exist_ok=True)
+    # Threads can only be *entered* by name, never listed — blocks enumeration
+    # even if the mount-ns jail is somehow bypassed.
+    root.chmod(0o711)
     gc_task = asyncio.create_task(runner.gc_loop())
     yield
     gc_task.cancel()

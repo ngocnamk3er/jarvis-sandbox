@@ -35,10 +35,11 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY app ./app
 
-# Non-root — the pod is the isolation boundary, but no reason to run as root
-# inside it. /workspace is created + chowned so the emptyDir mount is writable.
-RUN useradd -m -u 10001 sandbox && mkdir -p /workspace && chown sandbox:sandbox /workspace
-USER sandbox
+# Runs as root: the service sets up a private mount namespace + drops each
+# agent command to a per-thread uid (see runner.py). util-linux (unshare /
+# setpriv / mount) is in the base image. /data is the emptyDir mount.
+RUN mkdir -p /data
+ENV DATA_ROOT=/data
 
 EXPOSE 8000
 CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]

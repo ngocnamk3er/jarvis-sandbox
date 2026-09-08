@@ -1,6 +1,14 @@
-"""The whole sandbox: one shared container, a working directory per
-conversation under WORKSPACE_ROOT/{thread_id}. No isolation beyond the pod
-itself — every conversation shares CPU/RAM/disk (by design)."""
+"""The whole sandbox: one shared container, but every conversation runs in
+its own private view.
+
+On disk: DATA_ROOT/<thread_id>/ is a conversation's "prefix" — the service
+manages it; the agent never sees it. DATA_ROOT/<thread_id>/workspace/ is the
+only thing the agent touches: each `exec_command` runs inside a fresh mount
+namespace where that dir is bind-mounted onto /workspace, and the command
+runs as a per-thread uid. So `cd /workspace/<other>` can't resolve, `pwd` is
+always /workspace, and one conversation cannot read or write another's files
+(previously it could — they were all siblings under a world-writable
+/workspace, same uid)."""
 
 import asyncio
 import contextlib
@@ -10,6 +18,7 @@ import re
 import shutil
 import signal
 import time
+import zlib
 from pathlib import Path
 
 from app.core.config import settings
@@ -29,14 +38,45 @@ for _ext, _mime in {
     mimetypes.add_type(_mime, _ext)
 
 
-def _thread_dir(thread_id: str) -> Path:
-    safe = _SAFE_ID.sub("", thread_id) or "default"
-    d = Path(settings.WORKSPACE_ROOT) / safe
-    return d
+def _safe_id(thread_id: str) -> str:
+    safe = _SAFE_ID.sub("", thread_id or "")
+    if not safe:
+        raise ValueError("invalid thread_id")
+    return safe
 
 
-def _touch(d: Path) -> None:
-    (d / _MARKER).touch()
+def _thread_root(thread_id: str) -> Path:
+    """DATA_ROOT/<thread_id> — the conversation's prefix (service-only)."""
+    return Path(settings.DATA_ROOT) / _safe_id(thread_id)
+
+
+def _thread_workspace(thread_id: str) -> Path:
+    """DATA_ROOT/<thread_id>/workspace — bind-mounted to /workspace per exec."""
+    return _thread_root(thread_id) / "workspace"
+
+
+def _thread_uid(thread_id: str) -> int:
+    """A stable, distinct uid per conversation for setpriv."""
+    return settings.UID_BASE + zlib.crc32(_safe_id(thread_id).encode()) % settings.UID_RANGE
+
+
+def _prepare(thread_id: str) -> tuple[Path, Path, int]:
+    """mkdir the thread's tree, chown it to the thread uid, touch the marker
+    (marker lives at the prefix, outside the agent's /workspace view)."""
+    root = _thread_root(thread_id)
+    ws = root / "workspace"
+    ws.mkdir(parents=True, exist_ok=True)
+    uid = _thread_uid(thread_id)
+    for p in (root, ws):
+        with contextlib.suppress(OSError):
+            os.chown(p, uid, uid)
+    (root / _MARKER).touch()
+    return root, ws, uid
+
+
+def _touch(root: Path) -> None:
+    with contextlib.suppress(OSError):
+        (root / _MARKER).touch()
 
 
 def _truncate(b: bytes) -> str:
@@ -46,17 +86,33 @@ def _truncate(b: bytes) -> str:
     return text
 
 
-async def exec_command(thread_id: str, command: str, timeout_seconds: int) -> dict:
-    d = _thread_dir(thread_id)
-    d.mkdir(parents=True, exist_ok=True)
-    _touch(d)
+# The command runs: in a private mount namespace, with the thread's own
+# workspace bind-mounted onto /workspace, dropped to the thread's uid.
+# `mount` needs CAP_SYS_ADMIN so it happens before setpriv drops privileges.
+_JAIL = (
+    'mount --bind "$SBX_WS" /workspace && cd /workspace && '
+    'exec setpriv --reuid "$SBX_UID" --regid "$SBX_UID" --clear-groups '
+    '     --inh-caps=-all bash -c "$SBX_CMD"'
+)
 
-    proc = await asyncio.create_subprocess_shell(
-        command,
-        cwd=str(d),
+
+async def exec_command(thread_id: str, command: str, timeout_seconds: int) -> dict:
+    root, ws, uid = _prepare(thread_id)
+
+    proc = await asyncio.create_subprocess_exec(
+        "unshare", "--mount", "--propagation", "private", "--", "sh", "-c", _JAIL,
+        cwd="/",
+        env={
+            "SBX_WS": str(ws),
+            "SBX_UID": str(uid),
+            "SBX_CMD": command,          # only ever reaches `bash -c "$SBX_CMD"`
+            "HOME": "/workspace",
+            "PATH": "/usr/local/bin:/usr/bin:/bin",
+            "PYTHONDONTWRITEBYTECODE": "1",
+        },
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
-        # Own process group so a timeout can kill the whole tree, not just the shell.
+        # Own process group so a timeout can kill the whole tree.
         start_new_session=True,
     )
     try:
@@ -79,22 +135,23 @@ async def exec_command(thread_id: str, command: str, timeout_seconds: int) -> di
             "timed_out": True,
         }
     finally:
-        _touch(d)
+        _touch(root)
 
 
 def read_file(thread_id: str, name: str) -> tuple[bytes, str, str]:
     """Returns (bytes, mime_type, basename). Raises FileNotFoundError /
-    IsADirectoryError / ValueError(path escape) / ValueError(too large).
+    IsADirectoryError / ValueError.
 
-    A relative `name` resolves against the conversation's own dir; an absolute
-    path is taken as-is. Either way it must land under the shared WORKSPACE_ROOT
-    — conversations already share this pod's disk (by design), and the agent
-    sometimes writes via `cd /workspace`, one level above its own dir."""
-    root = Path(settings.WORKSPACE_ROOT).resolve()
-    d = _thread_dir(thread_id).resolve()
+    `name` must be a relative path with no `..` — it resolves inside this
+    conversation's own workspace and nowhere else. The service runs as root
+    (so the OS won't stop a traversal here); this check is the only thing
+    that does."""
+    ws = _thread_workspace(thread_id).resolve()
     raw = Path(name)
-    target = (raw if raw.is_absolute() else d / raw).resolve()
-    if not (target == root or root in target.parents):
+    if raw.is_absolute() or ".." in raw.parts:
+        raise ValueError("path must be a relative name inside the workspace")
+    target = (ws / raw).resolve()
+    if target != ws and ws not in target.parents:
         raise ValueError("path escapes the workspace")
     if not target.exists():
         raise FileNotFoundError(name)
@@ -108,24 +165,22 @@ def read_file(thread_id: str, name: str) -> tuple[bytes, str, str]:
 
 
 def reset(thread_id: str) -> None:
-    shutil.rmtree(_thread_dir(thread_id), ignore_errors=True)
+    """Wipe a conversation's whole tree (prefix + workspace)."""
+    with contextlib.suppress(ValueError):
+        shutil.rmtree(_thread_root(thread_id), ignore_errors=True)
 
 
 async def gc_loop() -> None:
-    root = Path(settings.WORKSPACE_ROOT)
+    root = Path(settings.DATA_ROOT)
     interval = 600
     while True:
         await asyncio.sleep(interval)
         cutoff = time.time() - settings.IDLE_GC_MINUTES * 60
         with contextlib.suppress(FileNotFoundError):
-            for child in root.iterdir():
-                if child.is_dir():
-                    marker = child / _MARKER
-                    mtime = marker.stat().st_mtime if marker.exists() else child.stat().st_mtime
-                    if mtime < cutoff:
-                        shutil.rmtree(child, ignore_errors=True)
-                # loose files at the root — an agent that ran `cd /workspace`
-                # instead of staying in its own dir; drop them once stale too.
-                elif child.stat().st_mtime < cutoff:
-                    with contextlib.suppress(OSError):
-                        child.unlink()
+            for child in root.iterdir():          # DATA_ROOT/<thread_id>
+                if not child.is_dir():
+                    continue
+                marker = child / _MARKER
+                mtime = marker.stat().st_mtime if marker.exists() else child.stat().st_mtime
+                if mtime < cutoff:
+                    shutil.rmtree(child, ignore_errors=True)
