@@ -91,15 +91,18 @@ def _truncate(b: bytes) -> str:
     return text
 
 
-# The command runs in a private mount namespace:
+# The command runs in a private mount + PID namespace:
 #   1. bind the thread's own workspace onto /workspace
-#   2. mask DATA_ROOT entirely (a tmpfs with mode 000) so the real
-#      /data/<other_thread>/... paths simply don't exist for the command
-#   3. drop to the thread's uid and run
-# `mount` needs CAP_SYS_ADMIN, so it all happens before setpriv drops privs.
+#   2. mask DATA_ROOT (tmpfs mode 000) — /data/<other_thread>/... ceases to exist
+#   3. give it a private /tmp (tmpfs) — no shared scratch between conversations
+#   4. fresh /proc for the PID namespace — can't see other conversations' processes
+#   5. drop to the thread's uid and run
+# mount + unshare need CAP_SYS_ADMIN, so it all happens before setpriv drops privs.
 _JAIL = (
     'mkdir -p /workspace && mount --bind "$SBX_WS" /workspace && '
     'mount -t tmpfs -o mode=000,size=1M tmpfs "$SBX_DATA" && '
+    'mount -t tmpfs -o mode=1777,size=64m tmpfs /tmp && '
+    'mount -t proc proc /proc && '
     'cd /workspace && '
     'exec setpriv --reuid "$SBX_UID" --regid "$SBX_UID" --clear-groups '
     '     --inh-caps=-all bash -c "$SBX_CMD"'
@@ -110,7 +113,8 @@ async def exec_command(thread_id: str, command: str, timeout_seconds: int) -> di
     root, ws, uid = _prepare(thread_id)
 
     proc = await asyncio.create_subprocess_exec(
-        "unshare", "--mount", "--propagation", "private", "--", "sh", "-c", _JAIL,
+        "unshare", "--mount", "--pid", "--fork", "--propagation", "private",
+        "--", "sh", "-c", _JAIL,
         cwd="/",
         env={
             "SBX_WS": str(ws),
