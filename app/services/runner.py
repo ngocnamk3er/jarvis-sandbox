@@ -69,9 +69,12 @@ def _prepare(thread_id: str) -> tuple[Path, Path, int]:
     uid = _thread_uid(thread_id)
     for p in (root, ws):
         with contextlib.suppress(OSError):
+            os.chmod(p, 0o700)     # before chown: root can chmod what it owns
+                                   # without CAP_FOWNER. 0700 — DATA_ROOT is
+                                   # traversable (0711) so another thread's uid
+                                   # must get nothing inside a thread dir.
+        with contextlib.suppress(OSError):
             os.chown(p, uid, uid)
-            os.chmod(p, 0o700)     # 0700 — DATA_ROOT is traversable (0711), so
-                                   # another thread's uid must get nothing here
     (root / _MARKER).touch()       # root creates it fine even in a 0700 dir
     return root, ws, uid
 
