@@ -38,7 +38,7 @@ COPY app ./app
 # Runs as root: the service sets up a private mount namespace + drops each
 # agent command to a per-thread uid (see runner.py). util-linux (unshare /
 # setpriv / mount) is in the base image. /data is the emptyDir mount.
-RUN mkdir -p /data
+RUN mkdir -p /data /workspace
 ENV DATA_ROOT=/data
 
 EXPOSE 8000

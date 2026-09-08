@@ -90,7 +90,7 @@ def _truncate(b: bytes) -> str:
 # workspace bind-mounted onto /workspace, dropped to the thread's uid.
 # `mount` needs CAP_SYS_ADMIN so it happens before setpriv drops privileges.
 _JAIL = (
-    'mount --bind "$SBX_WS" /workspace && cd /workspace && '
+    'mkdir -p /workspace && mount --bind "$SBX_WS" /workspace && cd /workspace && '
     'exec setpriv --reuid "$SBX_UID" --regid "$SBX_UID" --clear-groups '
     '     --inh-caps=-all bash -c "$SBX_CMD"'
 )
