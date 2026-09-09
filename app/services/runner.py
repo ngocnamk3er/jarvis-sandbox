@@ -69,13 +69,13 @@ def _prepare(thread_id: str) -> tuple[Path, Path, int]:
     uid = _thread_uid(thread_id)
     for p in (root, ws):
         with contextlib.suppress(OSError):
-            os.chmod(p, 0o700)     # before chown: root can chmod what it owns
-                                   # without CAP_FOWNER. 0700 — DATA_ROOT is
-                                   # traversable (0711) so another thread's uid
-                                   # must get nothing inside a thread dir.
+            os.chmod(p, 0o700)  # before chown: root can chmod what it owns
+            # without CAP_FOWNER. 0700 — DATA_ROOT is
+            # traversable (0711) so another thread's uid
+            # must get nothing inside a thread dir.
         with contextlib.suppress(OSError):
             os.chown(p, uid, uid)
-    (root / _MARKER).touch()       # root creates it fine even in a 0700 dir
+    (root / _MARKER).touch()  # root creates it fine even in a 0700 dir
     return root, ws, uid
 
 
@@ -101,9 +101,9 @@ def _truncate(b: bytes) -> str:
 _JAIL = (
     'mkdir -p /workspace && mount --bind "$SBX_WS" /workspace && '
     'mount -t tmpfs -o mode=000,size=1M tmpfs "$SBX_DATA" && '
-    'mount -t tmpfs -o mode=1777,size=64m tmpfs /tmp && '
-    'mount -t proc proc /proc && '
-    'cd /workspace && '
+    "mount -t tmpfs -o mode=1777,size=64m tmpfs /tmp && "
+    "mount -t proc proc /proc && "
+    "cd /workspace && "
     'exec setpriv --reuid "$SBX_UID" --regid "$SBX_UID" --clear-groups '
     '     --inh-caps=-all bash -c "$SBX_CMD"'
 )
@@ -113,14 +113,22 @@ async def exec_command(thread_id: str, command: str, timeout_seconds: int) -> di
     root, ws, uid = _prepare(thread_id)
 
     proc = await asyncio.create_subprocess_exec(
-        "unshare", "--mount", "--pid", "--fork", "--propagation", "private",
-        "--", "sh", "-c", _JAIL,
+        "unshare",
+        "--mount",
+        "--pid",
+        "--fork",
+        "--propagation",
+        "private",
+        "--",
+        "sh",
+        "-c",
+        _JAIL,
         cwd="/",
         env={
             "SBX_WS": str(ws),
             "SBX_DATA": settings.DATA_ROOT,
             "SBX_UID": str(uid),
-            "SBX_CMD": command,          # only ever reaches `bash -c "$SBX_CMD"`
+            "SBX_CMD": command,  # only ever reaches `bash -c "$SBX_CMD"`
             "HOME": "/workspace",
             "PATH": "/usr/local/bin:/usr/bin:/bin",
             "PYTHONDONTWRITEBYTECODE": "1",
@@ -192,7 +200,7 @@ async def gc_loop() -> None:
         await asyncio.sleep(interval)
         cutoff = time.time() - settings.IDLE_GC_MINUTES * 60
         with contextlib.suppress(FileNotFoundError):
-            for child in root.iterdir():          # DATA_ROOT/<thread_id>
+            for child in root.iterdir():  # DATA_ROOT/<thread_id>
                 if not child.is_dir():
                     continue
                 marker = child / _MARKER

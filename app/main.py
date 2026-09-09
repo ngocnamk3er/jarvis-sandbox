@@ -4,8 +4,8 @@ from pathlib import Path
 
 from fastapi import FastAPI
 
-from app.core.config import settings
 from app.api.v1.router import router as api_v1_router
+from app.core.config import settings
 from app.services import runner
 
 
