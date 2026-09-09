@@ -22,6 +22,12 @@ class Settings(BaseSettings):
     UID_BASE: int = 20000
     UID_RANGE: int = 40000
 
+    # LOCAL DEV ONLY. The namespace jail (unshare/mount/setpriv) needs root +
+    # CAP_SYS_ADMIN, which `make dev` on a laptop doesn't have. Set this to run
+    # commands with NO isolation (just cwd) so the service is usable locally.
+    # NEVER set it in a shared/prod deployment — it removes all sandboxing.
+    UNSAFE_NO_JAIL: bool = False
+
     class Config:
         env_file = ".env"
         case_sensitive = True
