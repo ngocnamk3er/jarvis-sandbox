@@ -126,6 +126,7 @@ async def test_gc_keeps_active_sandbox(fake_k8s, monkeypatch):
     monkeypatch.setattr(settings, "POOL_SIZE", 0)
     monkeypatch.setattr(settings, "MAX_SANDBOXES", 3)
     monkeypatch.setattr(settings, "IDLE_GC_MINUTES", 30)
+    monkeypatch.setattr(settings, "SANDBOX_TTL_MINUTES", 180)
     pool = SandboxPool(fake_k8s)
     await pool.start()
     await pool.claim("c1")
@@ -133,6 +134,36 @@ async def test_gc_keeps_active_sandbox(fake_k8s, monkeypatch):
     pool.touch("c1")
     await pool.gc_once()
     assert name not in fake_k8s.deleted
+
+
+async def test_gc_enforces_ttl_even_when_active(fake_k8s, monkeypatch):
+    monkeypatch.setattr(settings, "POOL_SIZE", 0)
+    monkeypatch.setattr(settings, "MAX_SANDBOXES", 3)
+    monkeypatch.setattr(settings, "IDLE_GC_MINUTES", 30)
+    monkeypatch.setattr(settings, "SANDBOX_TTL_MINUTES", 60)
+    pool = SandboxPool(fake_k8s)
+    await pool.start()
+    await pool.claim("c1")
+    name = pool._threads["c1"]
+    pool.touch("c1")  # still active...
+    fake_k8s._pods[name].created_ts = time.time() - 61 * 60  # ...but 61 min old
+    await pool.gc_once()
+    assert name in fake_k8s.deleted
+    assert "c1" not in pool._threads
+
+
+async def test_gc_prunes_cache_for_vanished_pod(fake_k8s, monkeypatch):
+    monkeypatch.setattr(settings, "POOL_SIZE", 0)
+    monkeypatch.setattr(settings, "MAX_SANDBOXES", 3)
+    pool = SandboxPool(fake_k8s)
+    await pool.start()
+    await pool.claim("c1")
+    name = pool._threads["c1"]
+    # pod disappears without going through release()
+    del fake_k8s._pods[name]
+    await pool.gc_once()
+    assert "c1" not in pool._threads
+    assert name not in pool._tokens
 
 
 async def _tick(n: int = 1):

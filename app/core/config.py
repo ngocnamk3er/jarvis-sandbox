@@ -41,13 +41,22 @@ class Settings(BaseSettings):
     # running image off the k8s API at startup, so the two never drift and CI
     # only has to bump one tag.
     SANDBOX_IMAGE: str = ""
-    POOL_SIZE: int = 1  # warm pods kept scheduled + Ready for instant claim
+    # Pool sizing. Default is pure on-demand: no idle pods are kept around, a
+    # pod is created when a conversation first needs one. Raise POOL_SIZE to
+    # keep that many pre-warmed pods Ready (hides the ~3-5s pod start on the
+    # first bash call), at the cost of that many idle pods holding requests.
+    POOL_SIZE: int = 0
     MAX_SANDBOXES: int = 6  # hard ceiling on total agent pods (capacity guard)
-    IDLE_GC_MINUTES: int = 60  # claimed pod untouched this long -> deleted
-    CLAIM_TIMEOUT_SECONDS: int = 40  # wait budget for an on-demand pod to be Ready
+    # A pod is deleted when EITHER: no bash call has touched it for
+    # IDLE_GC_MINUTES, OR it has simply existed for SANDBOX_TTL_MINUTES (a hard
+    # per-pod lifetime cap — the conversation gets a fresh pod on its next
+    # call, same as an idle reap or a pod restart).
+    IDLE_GC_MINUTES: int = 30
+    SANDBOX_TTL_MINUTES: int = 180
+    CLAIM_TIMEOUT_SECONDS: int = 40  # wait budget for a new pod to become Ready
     AGENT_PORT: int = 8000
-    RECONCILE_INTERVAL_SECONDS: int = 15  # pool top-up loop cadence
-    GC_INTERVAL_SECONDS: int = 600
+    RECONCILE_INTERVAL_SECONDS: int = 30  # warm-pool top-up cadence (no-op when POOL_SIZE=0)
+    GC_INTERVAL_SECONDS: int = 300
 
     # agent pod sizing (the hypervisor-less equivalent of E2B's vCPU/RAM knobs)
     SANDBOX_CPU_REQUEST: str = "100m"

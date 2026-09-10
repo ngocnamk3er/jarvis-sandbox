@@ -1,11 +1,14 @@
-"""Warm pool of one-pod-per-conversation sandboxes.
+"""One-pod-per-conversation sandboxes, created on demand.
 
-The orchestrator keeps `POOL_SIZE` **warm** agent pods scheduled and Ready. The
-first time a conversation runs bash, `claim()` hands it a warm pod — relabels
-it `claimed` + records `thread_id -> pod` — and a refill brings the pool back
-up. `release()` (on /reset) deletes the pod. An idle sweep deletes claimed
-pods no bash call has touched for `IDLE_GC_MINUTES`. Total pods never exceed
-`MAX_SANDBOXES`.
+The first time a conversation runs bash, `claim()` gives it an agent pod:
+normally by creating one right then (waiting ~3-5s for Ready), or — if
+`POOL_SIZE > 0` — by taking a pre-warmed one. The pod is relabelled `claimed`
+and `thread_id -> pod` is recorded. `release()` (on /reset) deletes it.
+
+A pod is deleted by the GC sweep when EITHER it has been idle for
+`IDLE_GC_MINUTES` (no bash call) OR it has simply lived `SANDBOX_TTL_MINUTES`
+(a hard per-pod lifetime). Total live pods never exceed `MAX_SANDBOXES`; past
+that, `claim()` raises `CapacityError` and the caller gets a 503.
 
 The `thread_id -> pod` mapping is authoritative in the pod's own labels; the
 in-memory dict is a cache rebuilt from labels on startup, so an orchestrator
@@ -99,13 +102,15 @@ class SandboxPool:
         warm = sum(1 for p in pods if p.labels.get(podspec.LABEL_STATE) == podspec.STATE_WARM)
         want = min(settings.POOL_SIZE - warm, settings.MAX_SANDBOXES - total)
         for _ in range(max(0, want)):
-            await self._spawn_warm_locked()
+            await self._spawn_pod_locked()
 
-    async def _spawn_warm_locked(self) -> PodView:
+    async def _spawn_pod_locked(self) -> PodView:
+        """Create a fresh agent pod (labelled `warm` — `claim()` relabels it
+        `claimed`, so a crash between the two just leaves a reusable warm pod)."""
         token = secrets.token_urlsafe(32)
         pod = await self.k8s.create_pod(podspec.build(self._image, token))
         self._tokens[pod.name] = token
-        logger.info("warm pod %s created", pod.name)
+        logger.info("agent pod %s created", pod.name)
         return pod
 
     # --------------------------------------------------------------- claim
@@ -155,12 +160,11 @@ class SandboxPool:
         return None
 
     async def _take_pod_locked(self) -> PodView:
-        # Runs under self._lock. The common path (a warm pod is Ready) returns
-        # immediately. Only the cold path — pool exhausted, spawn on demand —
-        # blocks here for up to CLAIM_TIMEOUT_SECONDS, which serialises other
-        # claims/releases for that window. Acceptable at this scale, and it's
-        # what guarantees we never blow past MAX_SANDBOXES. Keep POOL_SIZE >= 1
-        # so the cold path is rare.
+        # Runs under self._lock. With POOL_SIZE=0 (the default) every claim
+        # falls through to create-and-wait, holding the lock for up to
+        # CLAIM_TIMEOUT_SECONDS — that's what caps total pods at MAX_SANDBOXES
+        # without a race. Raise POOL_SIZE if that ~3-5s serialised wait on a
+        # conversation's first bash call matters.
         pods = await self.k8s.list_pods(_LABEL_SELECTOR)
         warm_ready = [
             p
@@ -173,7 +177,7 @@ class SandboxPool:
             raise CapacityError(
                 f"all {settings.MAX_SANDBOXES} sandbox slots are in use — retry shortly"
             )
-        pod = await self._spawn_warm_locked()
+        pod = await self._spawn_pod_locked()
         return await self._wait_ready_locked(pod.name)
 
     async def _wait_ready_locked(self, name: str) -> PodView:
@@ -223,33 +227,62 @@ class SandboxPool:
             logger.info("released sandbox %s (thread %s)", name, tid)
         asyncio.create_task(self._ensure_pool_bg())
 
+    async def _delete_claimed_locked(self, name: str, tid: str | None) -> None:
+        """Delete one claimed pod and forget its thread. Caller holds the lock."""
+        await self.k8s.delete_pod(name)
+        self._tokens.pop(name, None)
+        if tid:
+            self._threads.pop(tid, None)
+            self._last_used.pop(tid, None)
+
     # --------------------------------------------------------------- GC
     async def gc_once(self) -> None:
-        cutoff = time.time() - settings.IDLE_GC_MINUTES * 60
+        idle_cutoff = time.time() - settings.IDLE_GC_MINUTES * 60
+        ttl_seconds = settings.SANDBOX_TTL_MINUTES * 60
         async with self._lock:
             pods = await self.k8s.list_pods(_LABEL_SELECTOR)
+
+            # drop cache entries whose pod vanished out from under us (node
+            # eviction, a manual kubectl delete, a lost race)
+            live = {p.name for p in pods}
+            for tid, name in list(self._threads.items()):
+                if name not in live:
+                    self._threads.pop(tid, None)
+                    self._last_used.pop(tid, None)
+                    self._tokens.pop(name, None)
+
             for p in pods:
                 state = p.labels.get(podspec.LABEL_STATE)
                 if state == podspec.STATE_WARM:
-                    # a warm pod that never came up — clear it out
-                    if p.age_seconds() > 300 and not p.ready:
-                        logger.warning("GC stuck warm pod %s (phase %s)", p.name, p.phase)
+                    # a warm pod that never came up, or one that has aged out
+                    if (p.age_seconds() > 300 and not p.ready) or p.age_seconds() > ttl_seconds:
+                        logger.info(
+                            "GC warm pod %s (age %ds, ready=%s)", p.name, p.age_seconds(), p.ready
+                        )
                         await self.k8s.delete_pod(p.name)
                         self._tokens.pop(p.name, None)
                     continue
 
                 tid = p.labels.get(podspec.LABEL_THREAD)
+
+                # hard per-pod lifetime cap
+                if p.age_seconds() > ttl_seconds:
+                    logger.info(
+                        "GC sandbox %s (thread %s) — TTL %dm reached",
+                        p.name,
+                        tid,
+                        settings.SANDBOX_TTL_MINUTES,
+                    )
+                    await self._delete_claimed_locked(p.name, tid)
+                    continue
+
                 last = self._last_used.get(tid or "")
                 if last is None:
                     anno = p.annotations.get(podspec.ANNO_LAST_USED)
                     last = float(anno) if anno else p.created_ts
-                if last < cutoff:
+                if last < idle_cutoff:
                     logger.info("GC idle sandbox %s (thread %s)", p.name, tid)
-                    await self.k8s.delete_pod(p.name)
-                    self._tokens.pop(p.name, None)
-                    if tid:
-                        self._threads.pop(tid, None)
-                        self._last_used.pop(tid, None)
+                    await self._delete_claimed_locked(p.name, tid)
                 elif tid and tid in self._last_used:
                     # flush the in-memory clock onto the pod so a restart
                     # doesn't reset the idle timer
@@ -261,6 +294,8 @@ class SandboxPool:
 
     # --------------------------------------------------------------- loops
     async def reconcile_loop(self) -> None:
+        if settings.POOL_SIZE <= 0:
+            return  # pure on-demand — nothing to keep warm
         while True:
             await asyncio.sleep(settings.RECONCILE_INTERVAL_SECONDS)
             try:
@@ -277,6 +312,8 @@ class SandboxPool:
                 logger.exception("gc_once failed")
 
     async def _ensure_pool_bg(self) -> None:
+        if settings.POOL_SIZE <= 0:
+            return
         try:
             await self.ensure_pool()
         except Exception:
@@ -289,4 +326,6 @@ class SandboxPool:
             "threads": dict(self._threads),
             "pool_size": settings.POOL_SIZE,
             "max_sandboxes": settings.MAX_SANDBOXES,
+            "idle_gc_minutes": settings.IDLE_GC_MINUTES,
+            "ttl_minutes": settings.SANDBOX_TTL_MINUTES,
         }
