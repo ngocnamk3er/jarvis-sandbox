@@ -6,9 +6,11 @@ the isolation boundary:
     * its own PID / network / mount / IPC / UTS namespace (k8s gives every pod
       these)
     * runs as an unprivileged uid, every Linux capability dropped,
-      `allowPrivilegeEscalation: false`, `seccompProfile: RuntimeDefault`
-    * a NetworkPolicy that lets it reach the internet (pip / curl) but not any
-      other pod or Service in the cluster, nor the node metadata IP
+      `allowPrivilegeEscalation: false`, `seccompProfile: RuntimeDefault`,
+      read-only root filesystem (only /workspace, /tmp, /var/tmp are writable)
+    * a NetworkPolicy with no egress except DNS — it cannot reach the internet,
+      any other pod or Service, or the node metadata IP. The baked-in library
+      set is the whole environment; pip / uv are removed from the image.
     * deleted the moment the conversation ends or goes idle — never reused
 
 So this module just runs the command in `/workspace` and streams back
@@ -68,6 +70,12 @@ async def exec_command(command: str, timeout_seconds: int) -> dict:
         "PYTHONDONTWRITEBYTECODE": "1",
         "LANG": "C.UTF-8",
         "LC_ALL": "C.UTF-8",
+        # writable cache/config dirs for the read-only rootfs (matplotlib,
+        # fontconfig, …); NLTK corpora bundled in the image
+        "MPLCONFIGDIR": os.environ.get("MPLCONFIGDIR", "/tmp/.mplconfig"),
+        "XDG_CACHE_HOME": os.environ.get("XDG_CACHE_HOME", "/tmp/.cache"),
+        "XDG_CONFIG_HOME": os.environ.get("XDG_CONFIG_HOME", "/tmp/.config"),
+        "NLTK_DATA": os.environ.get("NLTK_DATA", "/usr/local/share/nltk_data"),
     }
 
     proc = await asyncio.create_subprocess_exec(

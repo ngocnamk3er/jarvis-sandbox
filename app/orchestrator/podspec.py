@@ -19,7 +19,9 @@ STATE_CLAIMED = "claimed"
 
 
 def build(image: str, token: str) -> dict:
-    """A single-container, non-root, no-capabilities, no-serviceaccount pod.
+    """A single-container, non-root, no-capabilities, no-serviceaccount,
+    read-only-rootfs, no-network-egress pod. The baked-in toolchain is all it
+    gets — pip/uv are stripped from the image.
     Created 'warm' (unclaimed); claim() patches the labels in place.
     """
     s = settings
@@ -27,16 +29,18 @@ def build(image: str, token: str) -> dict:
     pod_security = {
         "runAsNonRoot": True,
         "runAsUser": 1000,
-        # primary group stays 0 (the image makes site-packages group-0
-        # writable so `pip install` still works); fsGroup 1000 is added as a
-        # supplementary group and owns the emptyDir mounts.
+        # primary group 0; fsGroup 1000 is added as a supplementary group and
+        # owns the emptyDir mounts (/workspace, /tmp, /var/tmp).
         "fsGroup": 1000,
         "seccompProfile": {"type": "RuntimeDefault"},
     }
     container_security = {
         "allowPrivilegeEscalation": False,
         "capabilities": {"drop": ["ALL"]},
-        "readOnlyRootFilesystem": False,  # `pip install` writes site-packages
+        # The toolchain is fully baked into the image and the agent cannot add
+        # to it: pip/uv are stripped, the rootfs is read-only, and a
+        # NetworkPolicy blocks egress. Only the emptyDir mounts are writable.
+        "readOnlyRootFilesystem": True,
     }
 
     spec: dict = {
@@ -81,6 +85,7 @@ def build(image: str, token: str) -> dict:
                 "volumeMounts": [
                     {"name": "workspace", "mountPath": "/workspace"},
                     {"name": "tmp", "mountPath": "/tmp"},
+                    {"name": "vartmp", "mountPath": "/var/tmp"},
                 ],
                 "readinessProbe": {
                     "httpGet": {"path": f"{s.API_PREFIX}/health", "port": s.AGENT_PORT},
@@ -93,6 +98,7 @@ def build(image: str, token: str) -> dict:
         "volumes": [
             {"name": "workspace", "emptyDir": {"sizeLimit": s.SANDBOX_WORKSPACE_SIZE}},
             {"name": "tmp", "emptyDir": {"sizeLimit": s.SANDBOX_TMP_SIZE}},
+            {"name": "vartmp", "emptyDir": {"sizeLimit": "256Mi"}},
         ],
     }
     if s.SANDBOX_RUNTIME_CLASS:

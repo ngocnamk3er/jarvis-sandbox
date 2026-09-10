@@ -29,12 +29,16 @@ a full container escape. Giving each conversation its own pod moves the
 boundary to something k8s already enforces hard:
 
 - own **network / PID / mount / IPC / UTS namespace** (every pod gets these)
-- a **NetworkPolicy**: the command can reach the public internet (pip, curl —
-  the product needs this) but **not** other pods, Services, or the node
-  metadata IP
+- a **NetworkPolicy** with **no egress except DNS** — the command cannot reach
+  the internet, any other pod or Service, or the node metadata IP
 - **`runAsNonRoot`, drop ALL capabilities, `allowPrivilegeEscalation: false`,
-  `seccompProfile: RuntimeDefault`** — and the orchestrator needs no
-  privileges either, just `pods` RBAC in one namespace
+  `seccompProfile: RuntimeDefault`, `readOnlyRootFilesystem: true`** (only
+  `/workspace`, `/tmp`, `/var/tmp` are writable) — and the orchestrator needs
+  no privileges either, just `pods` RBAC in one namespace
+- **a fixed, offline toolchain** — the full data-analysis + doc-gen library set
+  is baked into the image; `pip` / `uv` are removed, so the agent cannot
+  install anything or pull data from a URL. No egress-driven cost, no
+  surprise dependency
 - per-pod **CPU / memory / ephemeral-storage limits** — a fork bomb or
   `malloc` loop hits only that conversation
 - the pod is **deleted when the conversation ends** (or ages out) — a fresh
@@ -180,7 +184,8 @@ conversation, until an idle reap / the TTL / a `reset`.
 | | old (shared container) | now (pod per conversation) |
 |---|---|---|
 | kernel | one, shared by all conversations | still shared (host kernel) — `SANDBOX_RUNTIME_CLASS=gvisor` for a per-sandbox kernel |
-| network | pod netns shared; could reach every in-cluster Service | own netns + NetworkPolicy: internet only, no cluster / metadata |
+| network | pod netns shared; could reach every in-cluster Service | own netns + NetworkPolicy: **no egress except DNS** |
+| toolchain | writable site-packages, `pip install` at runtime | fixed offline set baked in; pip / uv removed; read-only rootfs |
 | resource limits | tmpfs sizes + wall-clock only | per-pod cpu / memory / ephemeral-storage limits |
 | privileges | service ran as **root + `CAP_SYS_ADMIN`** | everything unprivileged, all caps dropped, seccomp RuntimeDefault |
 | blast radius of an escape | root in a `CAP_SYS_ADMIN` pod | unprivileged uid in a locked-down, disposable pod |
@@ -190,9 +195,11 @@ conversation, until an idle reap / the TTL / a `reset`.
 
 - **Shared host kernel.** A kernel LPE still crosses pods. `SANDBOX_RUNTIME_CLASS=gvisor`
   closes it; needs the RuntimeClass installed on the cluster (follow-up overlay).
-- **NetworkPolicy needs a policy-aware CNI** (`--cni=calico`). Inert otherwise.
-- **Image is ~3.5 GB.** With `POOL_SIZE=0` nothing idle is held, but a fresh
-  node still pulls it once; keep `POOL_SIZE` small if you raise it.
+- **NetworkPolicy needs a policy-aware CNI** (`--cni=calico`). Inert otherwise —
+  the read-only rootfs + stripped pip still block installs, but egress isn't
+  cut until the CNI enforces it.
+- **Image is ~3.5 GB** (offline: the whole toolchain plus NLTK corpora are
+  baked in). Pulled once per node; keep `POOL_SIZE` small if you raise it.
 - **First-call latency** ~3–5s (on-demand pod start) — raise `POOL_SIZE` to hide it.
 - Workspace is an `emptyDir` — a pod restart / GC / TTL loses it, `present_file`
   links 404 after. Expected; the agent regenerates files.
@@ -242,9 +249,12 @@ ArgoCD app `jarvis-sandbox` auto-syncs `sandbox/overlays/test`.
 
 ## The image
 
-`python:3.11-slim` + a data/analysis + document-generation toolchain (pandas,
-numpy, scipy, scikit-learn, matplotlib/seaborn/plotly, python-docx,
-python-pptx, openpyxl, reportlab, fpdf2, pandoc, `uv`). Runs as uid 1000,
-primary group 0 — site-packages is group-writable so the agent's
-`pip install <pkg>` still works non-root. ~3.5 GB; `COPY app` is last so
-app-only changes rebuild in seconds.
+`python:3.11-slim` + a complete, **fixed** data-analysis and doc-generation
+toolchain: numpy, pandas, scipy, statsmodels, pyarrow, scikit-learn, xgboost,
+lightgbm, matplotlib, seaborn, plotly, nltk (+ common corpora bundled),
+beautifulsoup4/lxml, python-docx, python-pptx, openpyxl, xlsxwriter, reportlab,
+fpdf2, pillow, jinja2, and `pandoc`. Runs as uid 1000. **`pip` and `uv` are
+removed** and the agent pod's rootfs is read-only, so the environment can't be
+changed at runtime — to add a library, add it to the `Dockerfile` and rebuild.
+Cache dirs (matplotlib, fontconfig, …) are pointed at `/tmp`. ~3.5 GB; `COPY
+app` is last so app-only changes rebuild in seconds.
