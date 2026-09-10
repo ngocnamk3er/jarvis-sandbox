@@ -105,16 +105,27 @@ async def exec_command(command: str, timeout_seconds: int) -> dict:
 def read_file(name: str) -> tuple[bytes, str, str]:
     """Return (bytes, mime_type, basename) for a file in the workspace.
 
-    `name` must be a relative path with no ".." — the same containment check
-    as before (reject absolute + "..", `.resolve()` to follow symlinks,
-    require the result inside the workspace), because this still runs as a
-    normal process the kernel would happily let follow a symlink out.
+    Accepts either a workspace-relative name (`report.docx`, `out/chart.png`)
+    or an absolute path that lands inside the workspace
+    (`/workspace/report.docx`) — the agent/LLM freely mixes the two because
+    `/workspace` is the working dir and the bash tool says both are fine for
+    writing. Anything that resolves outside the workspace (a real absolute
+    path like `/etc/passwd`, a `..`, a symlink pointing out) is still
+    rejected: this runs as a normal process the kernel would let follow a
+    symlink anywhere.
     """
     ws = _workspace().resolve()
-    raw = Path(name)
-    if raw.is_absolute() or ".." in raw.parts:
-        raise ValueError("path must be a relative name inside the workspace")
-    target = (ws / raw).resolve()
+    raw = name.strip()
+    # Normalise an in-workspace absolute path (or a leading "./") down to a
+    # relative name; leave anything else for the checks below to reject.
+    for prefix in (str(ws).rstrip("/") + "/", "/workspace/", "./"):
+        if raw.startswith(prefix):
+            raw = raw[len(prefix) :]
+            break
+    rel = Path(raw)
+    if rel.is_absolute() or ".." in rel.parts:
+        raise ValueError("path must be inside the workspace (no '..', nothing outside /workspace)")
+    target = (ws / rel).resolve()
     if target != ws and ws not in target.parents:
         raise ValueError("path escapes the workspace")
     if not target.exists():

@@ -55,11 +55,24 @@ def test_read_file_ok(workspace):
     assert name == "report.txt"
 
 
+def test_read_file_accepts_workspace_absolute_and_dot_slash(workspace):
+    (workspace / "report.txt").write_text("body")
+    (workspace / "out").mkdir()
+    (workspace / "out" / "chart.png").write_bytes(b"png")
+    # the agent/LLM mixes these forms for the same file
+    assert runner.read_file("report.txt")[0] == b"body"
+    assert runner.read_file("./report.txt")[0] == b"body"
+    assert runner.read_file("/workspace/report.txt")[0] == b"body"
+    assert runner.read_file("/workspace/out/chart.png")[0] == b"png"
+
+
 def test_read_file_rejects_traversal(workspace):
     with pytest.raises(ValueError):
         runner.read_file("../secret")
     with pytest.raises(ValueError):
         runner.read_file("/etc/passwd")
+    with pytest.raises(ValueError):
+        runner.read_file("/workspace/../etc/passwd")
 
 
 def test_read_file_rejects_symlink_escape(workspace, tmp_path):
