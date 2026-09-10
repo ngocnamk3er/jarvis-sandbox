@@ -1,145 +1,162 @@
 # jarvis-sandbox
 
 The code-execution sandbox behind the Jarvis agent's `bash` tool and
-`present_file`. One shared FastAPI service; every conversation gets its own
-private directory and every bash command runs inside a throwaway Linux
-namespace jail. Replaced OpenSandbox (its nested bwrap/userns isolation stopped
-working once the host kernel set `apparmor_restrict_unprivileged_userns=1`).
+`present_file`. **Every conversation gets its own dedicated pod** from a warm
+pool; the pod *is* the isolation boundary. One container image, two roles:
 
-## What it does
-
-| route | who calls it | what it does |
+| role | where it runs | what it does |
 |---|---|---|
-| `POST /api/v1/sandbox/exec` | jarvis-backend `bash` tool | run one bash command for `thread_id`, return `{stdout, stderr, exit_code, timed_out}` |
-| `GET  /api/v1/sandbox/read` | `present_file` / chat download chip | stream a file back out of the conversation's workspace |
-| `POST /api/v1/sandbox/reset` | `/chat/stop`, conversation delete | `rm -rf` a conversation's tree |
-| `GET  /api/v1/health` | probes | liveness |
+| **orchestrator** | one Deployment (`sandbox`), the Service jarvis-backend calls | keeps a warm pool of agent pods, maps `thread_id → pod`, proxies `exec`/`read`, deletes pods on `reset` / idle GC. Talks to the k8s API. |
+| **agent** | one pod per conversation, created by the orchestrator | runs the bash command in `/workspace` and streams back `{stdout, stderr, exit_code, timed_out}`; serves file reads for `present_file` |
 
-Every route except `/health` requires the `X-Internal-Api-Key` header
-(`INTERNAL_API_KEY`, shared with jarvis-backend). The service is never exposed
-to the ingress.
+Replaced a single shared container that ran every conversation's commands in a
+per-`exec` `unshare`/`setpriv`/`mount` namespace jail. That worked but shared
+one kernel, had no network isolation, and put the whole service one
+namespace-escape away from a root+`CAP_SYS_ADMIN` container. The pool model is
+E2B's shape (an orchestrator handing out per-session sandboxes) with a k8s pod
+in place of a Firecracker microVM.
+
+## API (unchanged — jarvis-backend didn't change)
+
+| route | caller | effect |
+|---|---|---|
+| `POST /api/v1/sandbox/exec` | backend `bash` tool | claim/reuse this `thread_id`'s pod, run one command in it |
+| `GET  /api/v1/sandbox/read` | `present_file` / chat download chip | stream a file out of the conversation's workspace |
+| `POST /api/v1/sandbox/reset` | `/chat/stop`, conversation delete | delete the conversation's pod |
+| `GET  /api/v1/health` | probes | liveness |
+| `GET  /api/v1/admin/pods` | debugging (in-cluster only) | current `thread → pod` map |
+
+Every route except `/health` and `/admin/pods` requires the
+`X-Internal-Api-Key` header (`INTERNAL_API_KEY`, shared with jarvis-backend).
+The orchestrator is never exposed to the ingress.
 
 ## How the isolation works
 
-On disk the service (root) keeps:
-
 ```
-$DATA_ROOT/                         0711 root    traversable, NOT listable
-$DATA_ROOT/<thread_id>/             0700 <uid>   the conversation "prefix"
-$DATA_ROOT/<thread_id>/.last_used   0644 root    GC marker (agent never sees it)
-$DATA_ROOT/<thread_id>/workspace/   0700 <uid>   the agent's /workspace
-```
-
-Each `exec` runs:
-
-```
-unshare --mount --pid --fork -- sh -c '
-    mount --bind $DATA_ROOT/<tid>/workspace  /workspace   # only this thread's dir
-    mount -t tmpfs -o mode=000               /data        # hide every other thread
-    mount -t tmpfs                           /tmp /var/tmp /dev/shm   # private scratch
-    mount -t proc proc                       /proc        # only own processes (PID ns)
-    cd /workspace
-    exec setpriv --reuid <uid> --regid <uid> --clear-groups --inh-caps=-all \
-        bash -c "$COMMAND"                                 # drop root -> unprivileged
-'
+jarvis-backend ──exec{thread_id,command}──▶ orchestrator (Deployment `sandbox`)
+                                              │  claim: pick a warm pod, relabel
+                                              │  it claimed + thread=<id>
+                                              ▼
+                                       agent pod  sbx-xxxx   (one per conversation)
+                                         • own PID / net / mount / IPC / UTS ns
+                                         • runAsNonRoot, drop ALL caps,
+                                           allowPrivilegeEscalation: false,
+                                           seccompProfile: RuntimeDefault
+                                         • NetworkPolicy: internet yes,
+                                           cluster + metadata IP no
+                                         • cpu/mem limits; /workspace + /tmp
+                                           are size-capped emptyDirs
+                                         • deleted on reset / 60-min idle GC
 ```
 
-Three layers, each a backstop for the last:
+There is **no in-pod jail** anymore — no `unshare`, `setpriv`, `mount --bind`,
+tmpfs masking or per-thread uid. One pod holds exactly one conversation and is
+thrown away after, so the pod's own boundary replaces all of it. The
+orchestrator runs unprivileged too; it only needs `pods` RBAC in the `jarvis`
+namespace.
 
-1. **mount namespace** — a sibling thread's path literally doesn't exist in the view
-2. **uid + `0700`** — even given the real path, the kernel denies a different uid
-3. **no privileges** — the command can't `mount`/`unshare`/`chown` to climb out
-   (`--inh-caps=-all`, and the image has every setuid bit stripped)
+**Pool state lives in the pods, not the orchestrator.** `thread_id` is a label
+on the pod; the per-pod agent token is a literal env var. An orchestrator
+restart lists the pods and re-adopts every running sandbox instead of orphaning
+it.
 
-`present_file`/`/read` runs in the service (root, not jailed), so `runner.read_file`
-does its own check: reject absolute paths + `..`, `.resolve()` (follows symlinks),
-require the result to be inside the workspace.
+`present_file` / `/read` is proxied to the agent, which still does its own
+containment check on `name` (reject absolute + `..`, `.resolve()` to follow
+symlinks, require the result inside `/workspace`).
 
-Details / the Linux primitives involved: see the module docstring in
-`app/services/runner.py`.
+### What improved vs. the shared container
+
+| | old (shared container) | now (pod per conversation) |
+|---|---|---|
+| kernel | one, shared by all conversations | still shared (host kernel) — set `SANDBOX_RUNTIME_CLASS=gvisor` for a per-sandbox kernel |
+| network | pod netns shared; could reach every in-cluster Service | own netns + NetworkPolicy: internet only, no cluster / metadata |
+| resource limits | tmpfs sizes + wall-clock only | per-pod cpu / memory / ephemeral-storage limits |
+| privileges | service ran as **root + `CAP_SYS_ADMIN`** | everything unprivileged, all caps dropped, seccomp RuntimeDefault |
+| blast radius of an escape | root in a `CAP_SYS_ADMIN` pod | unprivileged uid in a locked-down, disposable pod |
+
+### Still open
+
+- **Shared host kernel.** A kernel LPE still crosses pods. The gVisor toggle
+  (`SANDBOX_RUNTIME_CLASS`) closes this; needs the RuntimeClass installed on
+  the cluster (planned as a follow-up overlay).
+- **NetworkPolicy needs an enforcing CNI.** minikube's default bridge/kindnet
+  ignores NetworkPolicy — start with `--cni=calico`. Without it the policy is
+  inert (fail-open).
+- **Capacity is a hard cap** (`MAX_SANDBOXES`). Past it, `exec` returns 503 and
+  the backend surfaces "sandbox unavailable"; the conversation retries.
+- **Image is ~3.5 GB.** Keep `POOL_SIZE` small (1–2) on a single node.
+- Workspace is an `emptyDir` — a pod restart or GC loses it, and `present_file`
+  links 404 after. Same as before; the agent regenerates files.
 
 ## Run it locally
 
-The jail needs **root + `CAP_SYS_ADMIN`**, which `make dev` on a laptop doesn't
-have. Two options:
-
-### A. Dev mode, no isolation (fastest)
+Local dev runs the **agent** role only — bash in a directory, no cluster, no
+isolation. Fine for one developer (the orchestrator needs a real cluster).
 
 ```bash
-make install
-cp .env.example .env          # keep UNSAFE_NO_JAIL=true
-make dev                      # -> http://localhost:8003
+make install-dev
+cp .env.example .env         # SANDBOX_ROLE=agent, AGENT_TOKEN empty
+make dev                     # -> http://localhost:8003
 ```
-
-`UNSAFE_NO_JAIL=true` runs commands with just `cwd` set — **no sandboxing at
-all**. Fine for one developer on one machine; the service logs a warning on
-every exec. Never set it anywhere shared.
 
 Smoke test:
 
 ```bash
 curl -s localhost:8003/api/v1/sandbox/exec \
-  -H 'X-Internal-Api-Key: test-key' -H 'content-type: application/json' \
-  -d '{"thread_id":"t1","command":"echo hi > note.txt && cat note.txt && pwd"}'
+  -H 'X-Agent-Token: ' -H 'content-type: application/json' \
+  -d '{"command":"echo hi > note.txt && cat note.txt && pwd"}'
 ```
 
-### B. Real jail, in Docker
+`make test` runs the suite (`pytest`): the agent runner (exec, timeout,
+truncation, `read_file` containment) and the pool logic against a fake k8s
+client (claim / reuse / refill / capacity cap / idle GC / restart reconcile).
 
-```bash
-docker build -t jarvis-sandbox .
-docker run --rm -p 8003:8000 \
-  --cap-add SYS_ADMIN --security-opt apparmor=unconfined \
-  -e INTERNAL_API_KEY=test-key -e DATA_ROOT=/data \
-  jarvis-sandbox
-```
+## Config (`.env` / ConfigMap)
 
-`--cap-add SYS_ADMIN` lets `unshare`/`mount` work; the container's own root user
-then `setpriv`s each command down. This is the same posture as the k8s
-Deployment.
-
-### Wire it into jarvis-backend
-
-In jarvis-backend's `.env`: `SANDBOX_SERVICE_URL=http://localhost:8003` and the
-same `INTERNAL_API_KEY`.
-
-## Config (`.env`)
+Orchestrator:
 
 | var | default | meaning |
 |---|---|---|
+| `SANDBOX_ROLE` | `agent` | `orchestrator` or `agent` |
 | `INTERNAL_API_KEY` | — | shared secret with jarvis-backend |
-| `DATA_ROOT` | `/data` | root of the per-conversation trees (k8s: the emptyDir mount) |
-| `COMMAND_TIMEOUT_SECONDS` | `300` | per-command wall-clock limit; backend passes its own |
-| `IDLE_GC_MINUTES` | `60` | delete a conversation dir untouched for this long |
-| `UID_BASE` / `UID_RANGE` | `20000` / `40000` | per-thread uid pool for `setpriv` |
-| `UNSAFE_NO_JAIL` | `false` | **dev only** — run with no isolation |
+| `POD_NAMESPACE` | `jarvis` | namespace agent pods are created in |
+| `SANDBOX_IMAGE` | *(empty)* | agent-pod image; empty → orchestrator reads its own running image off the k8s API |
+| `POOL_SIZE` | `1` | warm pods kept Ready for instant claim |
+| `MAX_SANDBOXES` | `6` | hard ceiling on total agent pods |
+| `IDLE_GC_MINUTES` | `60` | delete a sandbox no `exec` touched for this long |
+| `CLAIM_TIMEOUT_SECONDS` | `40` | wait budget for an on-demand pod to be Ready |
+| `SANDBOX_CPU_*` / `SANDBOX_MEM_*` | see `.env.example` | agent pod resource requests/limits |
+| `SANDBOX_WORKSPACE_SIZE` / `SANDBOX_TMP_SIZE` | `2Gi` / `1Gi` | emptyDir size caps |
+| `SANDBOX_RUNTIME_CLASS` | *(empty)* | e.g. `gvisor` for a per-sandbox kernel |
+
+Agent (set by the orchestrator in the pod spec, or by `.env` locally):
+
+| var | default | meaning |
+|---|---|---|
+| `WORKSPACE_DIR` | `/workspace` | the one directory the command sees |
+| `COMMAND_TIMEOUT_SECONDS` | `300` | per-command wall-clock limit |
+| `AGENT_TOKEN` | *(empty)* | per-pod bearer token; empty disables the check (local dev) |
 
 ## Deploy (k8s)
 
-Manifests in `jarvis-deploy/sandbox/`. The Deployment runs as **`runAsUser: 0`**
-with `capabilities: {drop: [ALL], add: [SYS_ADMIN, SETUID, SETGID, CHOWN,
-FOWNER, DAC_OVERRIDE, KILL]}` and an ephemeral `emptyDir` at `/data`. ArgoCD app
-`jarvis-sandbox` auto-syncs it.
+Manifests in `jarvis-deploy/sandbox/`:
 
-CI: `Jenkinsfile` builds the image, pushes to the GitLab registry, and bumps
-`jarvis-deploy/sandbox/overlays/test/kustomization.yaml`. The Jenkins job exists
-but its GitLab push webhook isn't wired yet — until then, build locally +
-`minikube image load` + bump the overlay tag by hand (quote the tag — a bare
-7-hex like `6264e35` is valid YAML scientific notation and kustomize rejects it).
+- `orchestrator.yaml` — ServiceAccount + Role (`pods` verbs) + RoleBinding,
+  the `sandbox` Deployment (replicas 1, `Recreate`), the `sandbox` Service.
+- `networkpolicy.yaml` — locks the agent pods down (internet yes, cluster no).
+  **Needs a NetworkPolicy-enforcing CNI** (calico).
+- `configmap.yaml` — `sandbox-config`, consumed by the orchestrator; agent
+  pods derive their env from the same values.
+
+ArgoCD app `jarvis-sandbox` auto-syncs `sandbox/overlays/test`. CI
+(`Jenkinsfile`) builds one image and bumps the overlay's image tag — the
+orchestrator propagates that tag to agent pods automatically.
 
 ## The image
 
-`python:3.11-slim` + a data/analysis + document-generation toolchain baked in
+`python:3.11-slim` + a data/analysis + document-generation toolchain
 (pandas, numpy, scipy, scikit-learn, matplotlib/seaborn/plotly, python-docx,
-python-pptx, openpyxl, reportlab, fpdf2, pandoc, `uv` for ad-hoc installs).
-~3.5 GB; `COPY app` is last so app-only changes rebuild in seconds. Every
-setuid/setgid bit is stripped in the final layer.
-
-## Known gaps
-
-- Per-thread uid is `crc32(thread_id) % UID_RANGE` — collisions are possible,
-  but the mount namespace is the real boundary, not the uid.
-- The container's root filesystem (`/usr`, `/etc`, the service source at
-  `/app`) is readable by a jailed command — no secrets there, just code.
-- No `pip install` persistence: a pod restart is a fresh library set beyond the
-  baked-in ones. `emptyDir` `/workspace` is also wiped on restart — expected;
-  the agent regenerates files, and `present_file` links 404 after a restart.
+python-pptx, openpyxl, reportlab, fpdf2, pandoc, `uv`). Runs as uid 1000,
+primary group 0 — site-packages is made group-writable so the agent's
+`pip install <pkg>` still works. ~3.5 GB; `COPY app` is last so app-only
+changes rebuild in seconds.

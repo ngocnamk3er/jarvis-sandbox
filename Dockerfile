@@ -35,14 +35,26 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY app ./app
 
-# Runs as root: the service sets up a private mount namespace + drops each
-# agent command to a per-thread uid (see runner.py). util-linux (unshare /
-# setpriv / mount) is in the base image. /data is the emptyDir mount.
-RUN mkdir -p /data /workspace \
-    # strip every setuid/setgid bit — a jailed agent command never needs to
-    # act as another user (no su / login / mount / cron / ping-as-root here)
+# The image runs unprivileged (uid 1000, primary group 0 — the "arbitrary
+# uid" pattern). Both roles run as this user:
+#   * orchestrator: only needs the k8s API + outbound HTTP
+#   * agent: the pod itself is the sandbox, so the command runs as this same
+#     unprivileged uid with every capability dropped
+# site-packages + /usr/local/bin are made group-writable (+ setgid on dirs) so
+# the agent's `pip install <pkg>` still works without --user.
+RUN useradd --uid 1000 --gid 0 --create-home --home-dir /home/sandbox --shell /bin/bash sandbox \
+    && mkdir -p /workspace && chgrp 0 /workspace && chmod g+rwXs /workspace \
+    && chgrp -R 0 /usr/local/lib/python3.11/site-packages /usr/local/bin \
+    && chmod -R g+rwX /usr/local/lib/python3.11/site-packages /usr/local/bin \
+    && find /usr/local/lib/python3.11/site-packages -type d -exec chmod g+s {} + \
+    # strip every setuid/setgid bit — nothing here ever needs to act as another
+    # user (no su / login / mount / cron / ping-as-root)
     && find / -xdev -type f -perm /6000 -exec chmod -s {} + 2>/dev/null || true
-ENV DATA_ROOT=/data
+
+ENV HOME=/home/sandbox \
+    PYTHONDONTWRITEBYTECODE=1
+
+USER 1000
 
 EXPOSE 8000
 CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
