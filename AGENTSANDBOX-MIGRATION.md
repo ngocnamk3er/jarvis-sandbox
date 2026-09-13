@@ -352,7 +352,7 @@ Only do this if abandoning the migration — Phase 2 needs the install kept
 
 ---
 
-## Phase 2 — production migration (A/B/C shipped to prod repos, D/E/F remaining)
+## Phase 2 — production migration (A–E done, F wired but not flipped)
 
 Concrete plan, in dependency order. Each step is independently verifiable
 — A, C, and the core of B have now actually been verified live (not just
@@ -544,47 +544,99 @@ base image after this addition was fast — Docker's layer cache kept every
 `pip install numpy/pandas/...` layer intact, only the small
 `requirements.txt` install layer and everything after it re-ran.
 
-### D. Benchmark warm-pool behavior at jarvis's actual scale — not started
+### D. Benchmark warm-pool behavior at jarvis's actual scale — **done, verified live**
 
-jarvis-sandbox today: on-demand only (no idle warm pool,
-`POOL_SIZE=0`), hard ceiling `MAX_SANDBOXES=6`, per-pod TTL
-(`SANDBOX_TTL_MINUTES=180`). `SandboxWarmPool` is a genuinely different
-model — pre-warmed replicas sitting ready. Before committing:
-- Cold-start latency: on-demand agent-sandbox pod vs. jarvis-sandbox's
-  current cold pod creation, same image, same node.
-- Resource cost of keeping N pods warm at all times (jarvis-sandbox
-  deliberately doesn't, per an earlier explicit decision — see
-  [[jarvis-sandbox-service]]) vs. the latency win.
-- Whether `SandboxWarmPool` supports (or can be made to support) the same
-  "6 as a hard ceiling, not a target" + per-pod TTL behavior, or whether
-  that logic has to move into jarvis-backend/a controller of its own.
+Measured 2026-09-13 against the real hardened template/pool (jarvis's own
+image), same node, same image, both paths cold where comparable:
 
-### E. GitOps placement — not started
+| path | latency |
+|---|---|
+| jarvis-sandbox orchestrator, on-demand (`POOL_SIZE=0`, current prod config) | **~3.08–3.10s**, consistent across 3 runs |
+| agent-sandbox, warm-pool claim (`replicas: 1`, a pod already sitting ready) | **~27–31ms** — ~100x faster |
+| agent-sandbox, cold on-demand (pool scaled to `0`, forces a fresh pod) | **~1.54s** — still ~2x faster than jarvis-sandbox's own cold path |
 
-Once the Template/WarmPool YAML is final, it needs to live in
-`jarvis-deploy` (not ad-hoc `kubectl apply`, and not this repo) the same
-way `sandbox/base/*.yaml` does today, with its own ArgoCD Application —
-mirror the pattern `argocd/sandbox-application.yaml` already uses. The
-image build/push (`Dockerfile.agentsandbox`) needs a real Jenkins job the
-same as jarvis-sandbox's own (see the Jenkinsfile in this repo). The
-registry `access forbidden` gotcha above is **confirmed to reproduce through
-Jenkins' push path** (hit it on the real `33767e2` production push, not just
-ad-hoc local pushes — see Phase 1 Gotchas) — any Jenkins job for this image
-needs either a real fix for the registry issue first, or the `minikube
-image load` recovery wired in as an automated post-deploy step, not left as
-something a human has to remember to do by hand.
+Even agent-sandbox's *cold* path beats jarvis-sandbox's current cold path
+by 2x — the controller's reconcile loop plus the template's aggressive
+readiness probe (`periodSeconds: 1`, `initialDelaySeconds: 0`) apparently
+just beats jarvis-sandbox's own orchestrator loop, not merely a warm-pool
+artifact. Resource cost of `replicas: 1` is one idle pod's requests (100m
+CPU / 256Mi mem) at all times — same order of magnitude as jarvis-sandbox's
+own `POOL_SIZE>0` tradeoff, nothing new to reason about there.
 
-### F. Cutover — not started, deliberately
+Not benchmarked: `SandboxWarmPool`'s behavior at `MAX_SANDBOXES`-equivalent
+concurrency (6 simultaneous claims) or whether it supports a hard ceiling
+the way jarvis-sandbox's pool does — still open if cutover proceeds to
+real scale.
 
-This pass stopped here on purpose: everything above is local/reviewable
-code plus test resources in a namespace nothing production depends on.
-Cutover touches jarvis-backend's real deployment and (at the end)
-decommissions jarvis-sandbox's real orchestrator — a live-traffic,
-hard-to-reverse change, not something to do as a side effect of a
-research pass. Whoever picks this up:
+### E. GitOps placement — **Template/WarmPool/NetworkPolicy done, Jenkins job still missing**
 
-Only after A–E are each independently verified: point
-`sandbox_manager.py` at the new path behind a flag, run both stacks side
-by side for a real conversation sample, compare correctness first,
-latency/cost second, then decommission the jarvis-sandbox orchestrator
-Deployment and its CRD-free pod-pool code once nothing depends on it.
+`jarvis-deploy` commit `02d4935` (not yet pushed) adds `agentsandbox/base/`
+(SandboxTemplate + SandboxWarmPool + NetworkPolicy, mirroring `sandbox/`'s
+own base+overlay split) and `argocd/agentsandbox-application.yaml`
+(destination namespace `default`, `prune: true` + `selfHeal: true`, same
+posture as `sandbox-application.yaml`). Verified `kubectl kustomize
+agentsandbox/overlays/test` before committing produces byte-identical spec
+to what's actually live — first sync will be a no-op, not a surprise
+rollout.
+
+**Deliberately not GitOps'd:** the RBAC (ServiceAccount + Role +
+RoleBinding letting jarvis-backend talk to `sandboxclaims`/`sandboxes`).
+Granting new permissions isn't something to put behind automated sync —
+stays a manual, reviewed `kubectl apply`, applied once by a human, not
+something ArgoCD's `selfHeal` should be able to silently re-create if
+someone deletes it. The YAML lives in this doc's Phase 2 step B notes; get
+it from git history / ask whoever ran it.
+
+**Still missing:** a real Jenkins job for `Dockerfile.agentsandbox`. No
+credentials to set one up from an agent session — needs a human in the
+Jenkins UI (or a Jenkinsfile + job-DSL, but even that needs someone to
+register the job once). Until it exists, `agentsandbox/overlays/test`'s
+image tag is bumped by hand, same as `sandbox/overlays/test` was before its
+own job existed (see that overlay's own comment). Confirmed (Phase 1
+Gotchas): the registry `access forbidden` bug reproduces through a real
+Jenkins-built push — whoever sets this job up should expect to hit it and
+have the `minikube image load` recovery ready, not be surprised by it.
+
+### F. Cutover — **dispatcher wired, flag off; RBAC pending; in-cluster path still unverified**
+
+`jarvis-backend` commits `34fd2d8` + `7a2df3b` (not yet pushed) turn
+`sandbox_manager.py` into a dispatcher keyed on a new `SANDBOX_BACKEND`
+setting (`"legacy"` default, `"agentsandbox"` the switch) —
+`sandbox_manager_legacy.py` is the old client, byte-for-byte, under a new
+name; `sandbox_manager_agentsandbox.py` (step B) is now actually
+selectable. Every call site (`bash.py`, `present_file.py`, `files.py`,
+`web_search.py`, `web_fetch.py`, `sandbox_save.py`, `chat_service.py`,
+`conversation_service.py`, `chat.py`, `main.py`) is unchanged — none of
+them know which backend is live.
+
+**Verified locally:** with the default flag, the dispatcher resolves to
+the legacy backend and the `agentsandbox` module is never imported — a
+deploy of this commit alone, even without `k8s-agent-sandbox` installed
+yet, starts up and behaves exactly as before. With the flag flipped, the
+module import is attempted lazily and fails with a clear `ImportError`
+(not a crash) if the dependency is missing — confirmed both branches by
+hand, not just by reading the code.
+
+**Blocked, needs a human:** applying the RBAC (see step E) — an agent
+session isn't allowed to self-grant new k8s permissions, by design, and
+shouldn't be. Whoever does this next needs to `kubectl apply` it, then
+push both `jarvis-backend` (2 commits) and `jarvis-deploy` (1 commit) —
+another action needing a human's git credentials, not an agent's.
+
+**Still unverified — the one thing that matters most before flipping real
+traffic:** `SandboxInClusterConnectionConfig` actually working end-to-end
+*through this exact dispatcher path*, from inside the cluster, with the
+real RBAC. Everything verified so far (step B, step D above) used the SDK
+directly from outside the cluster (Tunnel mode) or the claim-management
+calls, which work identically regardless of connection mode. Once RBAC is
+applied and both repos are pushed, the next step is a throwaway pod (same
+new ServiceAccount, same image, `SANDBOX_BACKEND=agentsandbox`) running
+`sandbox_manager.exec_bash()` for real — *before* touching the real
+`backend` Deployment's ConfigMap. Only after that succeeds does flipping
+`SANDBOX_BACKEND` on the real Deployment become a "flip a ConfigMap value,
+watch it, flip it back if wrong" operation instead of a leap of faith.
+
+Decommissioning jarvis-sandbox's own orchestrator Deployment is still the
+very last step, after real traffic has run on the new backend long enough
+to trust it — not something to do as a side effect of getting the plumbing
+in place.
