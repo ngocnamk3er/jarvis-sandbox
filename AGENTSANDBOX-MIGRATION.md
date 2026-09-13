@@ -2,13 +2,29 @@
 
 Plan + verified setup for replacing jarvis-sandbox's own orchestrator/pod-pool
 with [kubernetes-sigs/agent-sandbox](https://agent-sandbox.sigs.k8s.io/docs/).
-Phase 1 is done and verified live. Phase 2 is now **partially implemented and
-verified live too** — steps A and C are done (real bugs found and fixed
-along the way, not just theoretical), step B's code is written and its
-trickiest piece (thread-to-sandbox reattachment) is verified live, but
-**nothing has been wired into jarvis-backend or deployed to production** —
-that's the cutover (step F), deliberately left for whoever's ready to do
-it with eyes open, not done automatically.
+Phase 1 is done and verified live. Phase 2 steps A, B, and C are done, and as
+of 2026-09-13 all three are **committed and shipped to both repos' main
+branches**, having gone through the real Jenkins → ArgoCD pipeline into the
+production `jarvis` namespace:
+
+- `jarvis-sandbox` commit `33767e2` (Phase 2 A+C — hardened adapter image +
+  `/upload`/`/download` filesystem endpoints) — live in the real `sandbox`
+  Deployment's pod.
+- `jarvis-backend` commit `d26a1b9` (Phase 2 B — `sandbox_manager_agentsandbox.py`)
+  — live in the real `backend` Deployment's pod.
+
+**This is code being live, not behavior changing.** Nothing here is on any
+live request path: `sandbox_manager_agentsandbox.py` isn't imported by any
+tool, `agentsandbox_server.py` only runs under `Dockerfile.agentsandbox`
+which no Jenkinsfile builds (the default `Dockerfile` does, unchanged
+entrypoint), and jarvis-backend has no RBAC to talk to agent-sandbox's CRDs.
+The two production Deployments behave exactly as before this push — only
+their images now happen to contain this additional, inert code (plus two
+small genuinely-shared additions: `runner.py`'s `write_file()`/
+`_resolve_in_workspace()` helpers, and `python-multipart` in
+`requirements.txt`). The cutover (step F) — the point where any of this
+starts actually being called — is still not started, deliberately, left for
+whoever's ready to do it with eyes open.
 
 ## Phase 1 — verified working
 
@@ -265,12 +281,39 @@ over the cluster network — see Phase 2, step B.
   OK`. Kubelet's own pull attempt still failed. Root cause not identified
   (likely a registry-side quirk specific to this instance/version) — the
   practical fix is `minikube image load` (see step 3), which bypasses the
-  registry pull path entirely. Anything pushed via Jenkins CI (existing
-  jarvis-* images) has never hit this — only ad-hoc `docker push` from a
-  local shell reproduced it. **Phase 2 should confirm whether a Jenkins-built
-  push hits this too before relying on it** — if it does, `minikube image
-  load` isn't an option in CI and this needs a real fix or a different
-  registry path.
+  registry pull path entirely.
+
+  **Confirmed 2026-09-13: this also hits a real Jenkins-built push, not just
+  ad-hoc local `docker push`.** Pushing `jarvis-sandbox` commit `33767e2`
+  triggered the normal Jenkins job (`docker build` the default `Dockerfile`,
+  `docker push`, ArgoCD bumps the `sandbox` Deployment's image to
+  `host.minikube.internal:5050/root/jarvis-sandbox:33767e20`) and the new pod
+  sat in `ImagePullBackOff` → `ErrImagePull` with the exact same `denied:
+  access forbidden` on the manifest HEAD request. In the same batch,
+  jarvis-backend's Jenkins-built push (`d26a1b9`) pulled and rolled out
+  clean — so this isn't a blanket "Jenkins vs. manual" split as originally
+  guessed, it looks tag/image-specific (maybe repo-path- or size-specific)
+  and still needs a real root cause. Until then, **assume every Phase 2 E
+  Jenkins push of a `jarvis-sandbox` image can hit this** and be ready to
+  apply the same recovery on the real production Deployment:
+
+  ```bash
+  # <tag> = the tag ArgoCD set on the stuck deployment/sandbox image
+  docker pull localhost:5050/root/jarvis-sandbox:<tag>
+  docker tag localhost:5050/root/jarvis-sandbox:<tag> \
+    host.minikube.internal:5050/root/jarvis-sandbox:<tag>
+  minikube image load host.minikube.internal:5050/root/jarvis-sandbox:<tag>
+  kubectl delete pod -n jarvis -l app=sandbox   # picks up the now-cached image
+  kubectl rollout status deployment/sandbox -n jarvis
+  ```
+
+  This same incident is also why the two image identities note above
+  matters in practice, not just in theory: the first `minikube image load`
+  attempt during this recovery used `localhost:5050/...` (matching what
+  `docker pull` had just fetched) and silently succeeded but didn't fix
+  anything — the Deployment references `host.minikube.internal:5050/...`,
+  a different image identity to containerd even at the same digest. Re-tag
+  before loading, every time.
 - **The docs site doesn't match the installed SDK.** The "Custom
   Environment" doc page shows a server expecting
   `{"command": {"content": ..., "env": ...}}` in and `{"exitCode": ...}`
@@ -309,7 +352,7 @@ Only do this if abandoning the migration — Phase 2 needs the install kept
 
 ---
 
-## Phase 2 — production migration (A/C done, B written, D/E/F remaining)
+## Phase 2 — production migration (A/B/C shipped to prod repos, D/E/F remaining)
 
 Concrete plan, in dependency order. Each step is independently verifiable
 — A, C, and the core of B have now actually been verified live (not just
@@ -523,9 +566,13 @@ Once the Template/WarmPool YAML is final, it needs to live in
 way `sandbox/base/*.yaml` does today, with its own ArgoCD Application —
 mirror the pattern `argocd/sandbox-application.yaml` already uses. The
 image build/push (`Dockerfile.agentsandbox`) needs a real Jenkins job the
-same as jarvis-sandbox's own (see the Jenkinsfile in this repo) — confirm
-whether the registry `access forbidden` gotcha above reproduces through
-Jenkins' push path before depending on it.
+same as jarvis-sandbox's own (see the Jenkinsfile in this repo). The
+registry `access forbidden` gotcha above is **confirmed to reproduce through
+Jenkins' push path** (hit it on the real `33767e2` production push, not just
+ad-hoc local pushes — see Phase 1 Gotchas) — any Jenkins job for this image
+needs either a real fix for the registry issue first, or the `minikube
+image load` recovery wired in as an automated post-deploy step, not left as
+something a human has to remember to do by hand.
 
 ### F. Cutover — not started, deliberately
 
