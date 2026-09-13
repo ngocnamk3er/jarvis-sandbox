@@ -1,0 +1,20 @@
+# Thin adapter image for evaluating kubernetes-sigs/agent-sandbox as a
+# possible jarvis-sandbox backend: reuses the real jarvis-sandbox image
+# (already has the full pandas/numpy/matplotlib/python-docx/pandoc
+# toolchain baked in, and fastapi/uvicorn/pydantic) and just swaps the
+# entrypoint for one that speaks agent-sandbox's runtime contract instead
+# of jarvis-sandbox's own /api/v1/sandbox/* protocol.
+#
+# Build with: docker build -f Dockerfile.agentsandbox -t <tag> .
+# (build context is still the jarvis-sandbox repo root, same as the main
+# Dockerfile, so this COPY can reach app/agent/agentsandbox_server.py)
+ARG BASE_IMAGE=host.minikube.internal:5050/root/jarvis-sandbox:fcc48505
+FROM ${BASE_IMAGE}
+
+COPY app/agent/agentsandbox_server.py app/agent/agentsandbox_server.py
+# runner.py too — agentsandbox_server.py calls runner.write_file(), added
+# alongside it and not yet part of whatever runner.py BASE_IMAGE baked in.
+COPY app/agent/runner.py app/agent/runner.py
+
+EXPOSE 8888
+CMD ["uvicorn", "app.agent.agentsandbox_server:app", "--host", "0.0.0.0", "--port", "8888"]

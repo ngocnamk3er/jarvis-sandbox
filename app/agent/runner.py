@@ -110,22 +110,19 @@ async def exec_command(command: str, timeout_seconds: int) -> dict:
         }
 
 
-def read_file(name: str) -> tuple[bytes, str, str]:
-    """Return (bytes, mime_type, basename) for a file in the workspace.
+def _resolve_in_workspace(name: str) -> Path:
+    """Fold a workspace-relative name (`report.docx`, `out/chart.png`) or an
+    absolute path that lands inside the workspace (`/workspace/report.docx`)
+    down to one resolved `Path` inside `_workspace()`.
 
-    Accepts either a workspace-relative name (`report.docx`, `out/chart.png`)
-    or an absolute path that lands inside the workspace
-    (`/workspace/report.docx`) — the agent/LLM freely mixes the two because
-    `/workspace` is the working dir and the bash tool says both are fine for
-    writing. Anything that resolves outside the workspace (a real absolute
-    path like `/etc/passwd`, a `..`, a symlink pointing out) is still
-    rejected: this runs as a normal process the kernel would let follow a
-    symlink anywhere.
+    The agent/LLM freely mixes relative and `/workspace`-absolute forms
+    because `/workspace` is the working dir. Anything that resolves outside
+    the workspace (a real absolute path like `/etc/passwd`, a `..`, a
+    symlink pointing out) is rejected: this runs as a normal process the
+    kernel would let follow a symlink anywhere.
     """
     ws = _workspace().resolve()
     raw = name.strip()
-    # Normalise an in-workspace absolute path (or a leading "./") down to a
-    # relative name; leave anything else for the checks below to reject.
     for prefix in (str(ws).rstrip("/") + "/", "/workspace/", "./"):
         if raw.startswith(prefix):
             raw = raw[len(prefix) :]
@@ -136,6 +133,12 @@ def read_file(name: str) -> tuple[bytes, str, str]:
     target = (ws / rel).resolve()
     if target != ws and ws not in target.parents:
         raise ValueError("path escapes the workspace")
+    return target
+
+
+def read_file(name: str) -> tuple[bytes, str, str]:
+    """Return (bytes, mime_type, basename) for a file in the workspace."""
+    target = _resolve_in_workspace(name)
     if not target.exists():
         raise FileNotFoundError(name)
     if target.is_dir():
@@ -145,6 +148,18 @@ def read_file(name: str) -> tuple[bytes, str, str]:
         raise ValueError(f"file is {size} bytes, over the {_MAX_READ_BYTES} limit")
     mime = mimetypes.guess_type(target.name)[0] or "application/octet-stream"
     return target.read_bytes(), mime, target.name
+
+
+def write_file(name: str, content: bytes) -> None:
+    """Write `content` to a file in the workspace, creating parent dirs as
+    needed. Same path-safety rules as `read_file`."""
+    if len(content) > _MAX_READ_BYTES:
+        raise ValueError(f"file is {len(content)} bytes, over the {_MAX_READ_BYTES} limit")
+    target = _resolve_in_workspace(name)
+    if target.is_dir():
+        raise IsADirectoryError(name)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_bytes(content)
 
 
 def reset() -> None:
