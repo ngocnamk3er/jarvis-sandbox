@@ -14,12 +14,244 @@ sanity-check agent-sandbox itself), Phase 2 A–F (harden it, adapt
 jarvis-backend, wire it in, benchmark it, GitOps it, cut traffic over, tear
 the old thing down). Read top to bottom for the story, or jump to
 [Phase 2 step F](#f-cutover--done-2026-09-14-jarvis-sandboxs-own-orchestrator-no-longer-exists)
-for what the actual cutover looked like and what got deleted.
-If you're standing this up somewhere new rather than reading history, see
-[DEPLOY-STANDALONE.md](DEPLOY-STANDALONE.md) instead — though note that doc
-was written *before* this cutover and still frames jarvis-sandbox's own
-orchestrator as "the current system"; the agent-sandbox setup described in
-this doc is what's actually running today.
+for what the actual cutover looked like and what got deleted. For the
+practical "how is this actually deployed, what do I run to redo it", skip
+straight to [Current deployment](#current-deployment) below.
+
+> [DEPLOY-STANDALONE.md](DEPLOY-STANDALONE.md) is now **stale** — it was
+> written before this cutover for a different audience (deploying
+> jarvis-sandbox's own orchestrator behind a *different* chatbot) and still
+> frames that orchestrator as "the current system". Not rewritten yet;
+> until it is, this doc is the accurate one.
+
+## Current deployment
+
+The practical version — no narrative, just what's actually running and
+what to run to reproduce it. Two halves: the sandbox side (this repo +
+agent-sandbox's CRDs) and the jarvis-backend side (the client code that
+calls it).
+
+### Prerequisites (once per cluster)
+
+agent-sandbox's controller, CRDs, and router — see [Phase 1 §1](#1-install)
+for the exact install commands. Confirm they're there before anything
+below will work:
+
+```bash
+kubectl get pods -n agent-sandbox-system   # agent-sandbox-controller + sandbox-router-deployment, both Running
+kubectl get crd | grep agents.x-k8s.io     # sandboxes / sandboxclaims / sandboxtemplates / sandboxwarmpools
+```
+
+### Sandbox side — build the image, apply the Template/WarmPool
+
+```bash
+cd jarvis-sandbox
+# base image first (the real toolchain — pandas/docx/pandoc/...)
+docker build --provenance=false -t <registry>/jarvis-sandbox:<tag> .
+docker push <registry>/jarvis-sandbox:<tag>
+# thin adapter layer on top — swaps the entrypoint to agentsandbox_server.py
+docker build --provenance=false -f Dockerfile.agentsandbox \
+  --build-arg BASE_IMAGE=<registry>/jarvis-sandbox:<tag> \
+  -t <registry>/jarvis-sandbox:agentsandbox-<tag> .
+docker push <registry>/jarvis-sandbox:agentsandbox-<tag>
+```
+
+Then point the GitOps-tracked Template at that tag and push:
+
+```bash
+cd jarvis-deploy
+# edit agentsandbox/overlays/test/kustomization.yaml's images: newTag
+git add agentsandbox/overlays/test/kustomization.yaml
+git commit -m "agentsandbox: bump image to <tag>"
+git push
+```
+
+`jarvis-deploy/argocd/agentsandbox-application.yaml` (Application
+`jarvis-agentsandbox`, `prune: true` + `selfHeal: true`) auto-syncs
+`agentsandbox/overlays/test` from there — no manual `kubectl apply` needed
+once that Application already exists. First-time setup on a cluster that's
+never had it: `kubectl apply -f jarvis-deploy/argocd/agentsandbox-application.yaml`
+once, registering it; every push after that syncs on its own.
+
+The live Template today (verified straight off the cluster, not
+transcribed from memory):
+
+```yaml
+apiVersion: extensions.agents.x-k8s.io/v1beta1
+kind: SandboxTemplate
+metadata:
+  name: jarvis-agentsandbox-template
+  namespace: default
+spec:
+  podTemplate:
+    metadata:
+      labels: {app: jarvis-agentsandbox-agent}
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        fsGroup: 1000
+        seccompProfile: {type: RuntimeDefault}
+      containers:
+      - name: simple-sandbox
+        image: host.minikube.internal:5050/root/jarvis-sandbox:agentsandbox-1789297905
+        ports: [{containerPort: 8888}]
+        readinessProbe: {httpGet: {path: "/", port: 8888}, initialDelaySeconds: 0, periodSeconds: 1}
+        livenessProbe: {httpGet: {path: "/", port: 8888}, initialDelaySeconds: 2, periodSeconds: 10}
+        securityContext:
+          allowPrivilegeEscalation: false
+          capabilities: {drop: ["ALL"]}
+          readOnlyRootFilesystem: true
+        resources:
+          requests: {cpu: "100m", memory: "256Mi", ephemeral-storage: "512Mi"}
+          limits: {cpu: "2", memory: "2Gi"}
+        volumeMounts:
+        - {name: workspace, mountPath: /workspace}
+        - {name: tmp, mountPath: /tmp}
+        - {name: vartmp, mountPath: /var/tmp}
+      restartPolicy: "OnFailure"
+      volumes:
+      - {name: workspace, emptyDir: {sizeLimit: 2Gi}}
+      - {name: tmp, emptyDir: {sizeLimit: 1Gi}}
+      - {name: vartmp, emptyDir: {sizeLimit: 256Mi}}
+---
+apiVersion: extensions.agents.x-k8s.io/v1beta1
+kind: SandboxWarmPool
+metadata:
+  name: jarvis-agentsandbox-pool
+  namespace: default
+spec:
+  replicas: 1   # ~30ms warm claim vs ~1.5s cold — see Phase 2 step D
+  sandboxTemplateRef:
+    name: jarvis-agentsandbox-template
+```
+
+One thing the controller adds on its own that isn't in the YAML above:
+`kubectl get sandboxtemplate ... -o yaml` also shows
+`networkPolicyManagement: Managed` — the controller auto-creates its own
+per-Template NetworkPolicy (`jarvis-agentsandbox-template-network-policy`,
+selector on the auto-stamped `sandbox-template-ref-hash` label). The
+`jarvis-agentsandbox-agent` NetworkPolicy in
+`jarvis-deploy/agentsandbox/base/networkpolicy.yaml` was written by hand
+before noticing this — the two overlap; worth checking whether the
+hand-written one is still pulling weight or the controller's own makes it
+redundant, not yet done.
+
+### jarvis-backend side — RBAC, ServiceAccount, code
+
+**RBAC** (manual `kubectl apply`, deliberately not GitOps'd — see Phase 2
+step E for why):
+
+```yaml
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: jarvis-backend
+  namespace: jarvis
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: jarvis-backend-agentsandbox
+  namespace: default
+rules:
+  - apiGroups: ["extensions.agents.x-k8s.io"]
+    resources: ["sandboxclaims"]
+    verbs: ["get", "list", "watch", "create", "delete"]
+  - apiGroups: ["agents.x-k8s.io"]   # core CRD — NOT extensions.*, easy to get wrong (see Phase 2 step F)
+    resources: ["sandboxes"]
+    verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: jarvis-backend-agentsandbox
+  namespace: default
+roleRef: {apiGroup: rbac.authorization.k8s.io, kind: Role, name: jarvis-backend-agentsandbox}
+subjects:
+  - {kind: ServiceAccount, name: jarvis-backend, namespace: jarvis}
+```
+
+**ServiceAccount wiring** — `jarvis-deploy/backend/base/backend.yaml`'s
+`template.spec.serviceAccountName: jarvis-backend` (GitOps'd like any other
+Deployment field — no reason this one needs to be manual).
+
+**Code** — `jarvis-backend/app/agents/tools/sandbox_manager.py` is the
+entire client, no flag/dispatcher (removed once the old orchestrator was
+gone — see Phase 2 step F). The shape any call site actually uses:
+
+```python
+# app/agents/tools/sandbox_manager.py
+from k8s_agent_sandbox import AsyncSandboxClient
+from k8s_agent_sandbox.models import SandboxInClusterConnectionConfig
+
+def init_client() -> None:
+    global _client
+    _client = AsyncSandboxClient(
+        connection_config=SandboxInClusterConnectionConfig(server_port=8888),
+    )
+
+async def exec_bash(thread_id: str, command: str) -> dict:
+    """Returns {stdout, stderr, exit_code, timed_out}."""
+    sandbox = await _get_or_create_sandbox(thread_id)  # claims by thread_id label, reuses if it exists
+    ...
+
+async def read_file(thread_id: str, name: str) -> tuple[bytes, str, str]: ...
+async def reset(thread_id: str) -> None: ...   # deletes the claim
+```
+
+`bash.py`, `present_file.py`, `chat.py`'s `/sandbox-file` endpoint, and
+everything else import `exec_bash`/`read_file`/`reset`/`get_thread_id`
+from here exactly like they always did — the whole point of keeping the
+same public surface across the migration was that none of them ever
+needed to change. One thing that *did* need fixing post-cutover: those
+call sites originally caught `httpx.HTTPError`/`httpx.HTTPStatusError`
+around `read_file()` (left over from the old httpx-based orchestrator
+client) — the SDK actually raises `k8s_agent_sandbox.exceptions.SandboxRequestError`.
+Fixed 2026-09-15 in `present_file.py` and `chat.py`; see that commit if
+adding a new call site that reads files.
+
+**Config** (`app/core/config.py`):
+
+```python
+AGENTSANDBOX_NAMESPACE: str = "default"
+AGENTSANDBOX_WARMPOOL: str = "jarvis-agentsandbox-pool"
+```
+
+**Dependency** (`requirements.txt`): `k8s-agent-sandbox[async]==1.0.2` —
+hard requirement now, not conditional on anything.
+
+### Verify
+
+Same smoke test used throughout this migration — from inside a real
+`backend` pod, through the actual `bash` tool (not a hand-rolled request):
+
+```bash
+kubectl exec -n jarvis deploy/backend -- python3 -c "
+import asyncio, sys
+sys.path.insert(0, '/app')
+
+async def main():
+    from app.agents.tools.bash import bash
+    from app.agents.tools import sandbox_manager
+    sandbox_manager.init_client()
+    thread_id = 'verify-test'
+    config = {'configurable': {'thread_id': thread_id}}
+    try:
+        result = await bash.ainvoke(
+            {'command': 'echo ok && python3 -c \"print(6*7)\"', 'label': 'verify'},
+            config=config,
+        )
+        print(result)
+    finally:
+        await sandbox_manager.reset(thread_id)
+        await sandbox_manager.close_client()
+
+asyncio.run(main())
+"
+```
+
+Expect `ok` then `42`, no traceback.
 
 ## Phase 1 — verified working
 
