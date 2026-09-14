@@ -329,6 +329,31 @@ over the cluster network — see Phase 2, step B.
   docs site — same applies to whatever jarvis-backend ends up calling
   directly in Phase 2 (don't trust the docs' request/response shape without
   re-verifying against installed code or a live curl test).
+- **The deployed `sandbox-router:latest-main` is a stale, functionally
+  different build from the `v1.0.2` source tag.** Confirmed 2026-09-14:
+  routing a genuinely SDK-claimed sandbox through the router (not a
+  guessed pod name — a real `create_sandbox()` claim) still 502'd. The
+  router's own pod logs gave the real reason —
+  `ERROR: Connection to sandbox at http://<pod>.default.svc.cluster.local:8888/...
+  failed. Error: [Errno -2] Name or service not known` — a **Python**
+  `socket.gaierror` message format, not Go. The `v1.0.2` source
+  (`sandbox-router/cache/cache.go`) is an informer-backed Go rewrite that
+  indexes claimed pods by name specifically so this resolves; whatever
+  commit `latest-main` was built from predates that rewrite entirely and
+  always falls to the broken DNS form. Since `latest-main` is a
+  perpetually-rebuilt staging tag (see cloudbuild.yaml: triggered off the
+  `main` branch, no version pin, no changelog to check against), there's
+  no way to know when/whether it'll pick up the Go rewrite without
+  rebuilding it yourself from a real tag — reinforcing why "build the
+  router from the `v1.0.2` source tag and stop depending on
+  `us-central1-docker.pkg.dev`'s staging build" (source already cloned,
+  Dockerfile + build command ready — see the migration doc's own repo
+  history / ask whoever has it) isn't just a company-network workaround,
+  it's the only way router-mode connections work *at all* against a
+  version-matched agent-sandbox install. Until that's built and deployed,
+  anything using this SDK from outside the cluster (or any connection mode
+  other than `SandboxInClusterConnectionConfig`) will 502 against this
+  cluster's router, regardless of claim status.
 
 ### Tear down Phase 1's test resources
 
@@ -450,25 +475,37 @@ candidate, not used by any tool yet.
 
 **Design, settled after live testing ruled out the alternative:**
 
-- **`SandboxInClusterConnectionConfig`, not Tunnel mode or hand-rolled
-  router calls.** Tunnel mode shells out to `kubectl port-forward` per
-  sandbox — wrong for a long-running backend (extra process per sandbox,
-  needs `kubectl` + kubeconfig baked into the image). The obvious
-  alternative — call `sandbox-router-svc` directly with
-  `X-Sandbox-ID`/`X-Sandbox-Namespace` headers, no SDK — was tried and
-  **empirically fails** for a sandbox not claimed through the SDK: curled
-  the router directly for a manually-created warm pod and got `502
-  Could not connect to the backend sandbox`; router logs showed it tried
-  `<name>.default.svc.cluster.local` (agent-sandbox creates no
-  per-Sandbox Service, so this never resolves) — `Name or service not
-  known`. The exact same router *did* successfully proxy straight to a
-  pod IP for a sandbox that had gone through `create_sandbox()`. So the
-  router's routing table is populated by the claim lifecycle, not by a
-  Sandbox object merely existing — which means claiming has to go through
-  the real client one way or another, and once it does,
-  `SandboxInClusterConnectionConfig` (client resolves the pod IP itself
-  from the Sandbox's own status, no router hop) is the natural choice,
-  not a shortcut around anything.
+- **`SandboxInClusterConnectionConfig`, not Tunnel mode or the router.**
+  Tunnel mode shells out to `kubectl port-forward` per sandbox — wrong for
+  a long-running backend (extra process per sandbox, needs `kubectl` +
+  kubeconfig baked into the image). Routing through `sandbox-router-svc`
+  instead (`SandboxDirectConnectionConfig`, the SDK's real router-mode
+  class — auto-injects `X-Sandbox-ID`/`-Namespace`/`-Port`, no need to
+  hand-roll headers) was tried **twice**, both times against a sandbox
+  genuinely claimed via `create_sandbox()`, and **both times 502'd**:
+  `{"detail":"Could not connect to the backend sandbox: <pod>"}`. (An
+  earlier note here claimed the router *did* work for a claimed sandbox —
+  that was wrong; re-verified 2026-09-14 with router pod logs checked
+  directly, not inferred, and it fails every time against what's actually
+  deployed.) Root cause, from the router's own logs: `Proxying request for
+  sandbox '<pod>' to URL: http://<pod>.default.svc.cluster.local:8888/...`
+  then `ERROR: ... Name or service not known` — the deployed
+  `sandbox-router:latest-main` always falls to DNS-form resolution
+  (`<id>.<namespace>.svc.cluster.local`, which never resolves — no
+  per-Sandbox Service exists), because it turns out to be an **old Python
+  build with no pod-IP cache at all** — not the informer-cache-backed Go
+  rewrite that exists at the `v1.0.2` source tag (see the router-image
+  Gotcha below; `latest-main` is a perpetually-rebuilt staging tag, no
+  version guarantee whatsoever). So: claiming *does* have to go through
+  the real client (the router genuinely can't resolve a guessed name
+  either way), but the router itself can't currently complete the proxy
+  regardless of claim status — making `SandboxInClusterConnectionConfig`
+  (client resolves the pod IP itself from the Sandbox's own status, no
+  router hop, unaffected by this bug) not just the tidier choice but
+  presently the *only working one*. Revisit router mode once a
+  `v1.0.2`-built router image is actually deployed — the code for that
+  connection mode is trivial to swap back in (see git history on this
+  file for the exact diff tried).
 - **A Kubernetes label carries `thread_id → claim_name`, not a database.**
   `create_sandbox()` always mints its own random `sandbox-claim-<uuid8>`
   name (not overridable), so a later `bash` call can't just recompute the
