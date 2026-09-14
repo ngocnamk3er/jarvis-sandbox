@@ -2,12 +2,23 @@
 
 The code-execution sandbox behind the Jarvis agent's `bash` tool and
 `present_file`. **Every conversation gets its own dedicated k8s pod**, created
-on demand; the pod *is* the isolation boundary. One container image, two roles:
+on demand; the pod *is* the isolation boundary.
 
-| role | where it runs | what it does |
-|---|---|---|
-| **orchestrator** | one Deployment (`sandbox`), the Service jarvis-backend calls | maps `thread_id → pod`, creates/deletes agent pods, proxies `exec`/`read`. Talks to the k8s API. |
-| **agent** | one pod per conversation, created by the orchestrator | runs the bash command in `/workspace`, streams back `{stdout, stderr, exit_code, timed_out}`, serves file reads for `present_file` |
+This repo builds the pod **image** (a fixed data-analysis + doc-generation
+toolchain, plus `app/agent/agentsandbox_server.py` — a small FastAPI server
+exposing `GET /`, `POST /execute`, `POST /upload`, `GET /download/<path>`).
+Pod *lifecycle* — creating one per conversation, routing requests to it,
+tearing it down — is owned by [kubernetes-sigs/agent-sandbox](https://agent-sandbox.sigs.k8s.io/docs/),
+not by anything in this repo. jarvis-backend talks to agent-sandbox's
+controller directly (see `app/agents/tools/sandbox_manager.py` in the
+jarvis-backend repo); there is no orchestrator Deployment here anymore.
+
+> jarvis-sandbox used to ship its own orchestrator (a Deployment that
+> created/tracked/deleted agent pods itself). That was decommissioned
+> 2026-09-14 in favor of agent-sandbox — see
+> [AGENTSANDBOX-MIGRATION.md](AGENTSANDBOX-MIGRATION.md) for the full
+> history of that move, and [DEPLOY-STANDALONE.md](DEPLOY-STANDALONE.md)
+> if you're setting this up somewhere new.
 
 ---
 
@@ -16,236 +27,107 @@ on demand; the pod *is* the isolation boundary. One container image, two roles:
 **The job.** The Jarvis agent (an LLM) writes and runs arbitrary bash: `pip
 install`, data crunching, generating `.docx`/`.pdf`/charts. That code is
 *untrusted-ish* — not a paying attacker with a 0-day, but "the model does
-something dumb, or a prompt injection tries something." It must not be able to
-read another conversation's files, reach internal cluster services, exfiltrate
-secrets, or wedge the box.
+something dumb, or a prompt injection tries something." It must not be able
+to read another conversation's files, reach internal cluster services,
+exfiltrate secrets, or wedge the box.
 
-**Why a pod per conversation.** The previous design was one shared container
-that wrapped every command in a per-`exec` `unshare`/`setpriv`/`mount`
-namespace jail. It worked, but: one shared kernel, no network isolation (a
-command could curl any in-cluster Service), no CPU/memory limits, and the
-service itself ran as **root with `CAP_SYS_ADMIN`** — one namespace-escape from
-a full container escape. Giving each conversation its own pod moves the
-boundary to something k8s already enforces hard:
+**Why a pod per conversation.** Giving each conversation its own pod moves
+the isolation boundary to something k8s already enforces hard:
 
 - own **network / PID / mount / IPC / UTS namespace** (every pod gets these)
-- a **NetworkPolicy** with **no egress except DNS** — the command cannot reach
-  the internet, any other pod or Service, or the node metadata IP
+- a **NetworkPolicy** with **no egress except DNS** — the command cannot
+  reach the internet, any other pod or Service, or the node metadata IP
 - **`runAsNonRoot`, drop ALL capabilities, `allowPrivilegeEscalation: false`,
   `seccompProfile: RuntimeDefault`, `readOnlyRootFilesystem: true`** (only
-  `/workspace`, `/tmp`, `/var/tmp` are writable) — and the orchestrator needs
-  no privileges either, just `pods` RBAC in one namespace
-- **a fixed, offline toolchain** — the full data-analysis + doc-gen library set
-  is baked into the image; `pip` / `uv` are removed, so the agent cannot
-  install anything or pull data from a URL. No egress-driven cost, no
-  surprise dependency
+  `/workspace`, `/tmp`, `/var/tmp` are writable)
+- **a fixed, offline toolchain** — the full data-analysis + doc-gen library
+  set is baked into the image; `pip` / `uv` are removed, so the agent cannot
+  install anything or pull data from a URL
 - per-pod **CPU / memory / ephemeral-storage limits** — a fork bomb or
   `malloc` loop hits only that conversation
 - the pod is **deleted when the conversation ends** (or ages out) — a fresh
   disposable machine each time, no cross-conversation reuse to reason about
 
 There is **no in-pod jail** — no `unshare`, `setpriv`, `mount --bind`, tmpfs
-masking, per-thread uid. One pod = one conversation = thrown away after, so the
-pod boundary replaces all of it. This is E2B's shape (an orchestrator handing
-out per-session sandboxes) with a k8s pod standing in for a Firecracker
-microVM.
+masking. One pod = one conversation = thrown away after, so the pod boundary
+replaces all of it. This is E2B's shape (a controller handing out
+per-session sandboxes) with a k8s pod standing in for a Firecracker microVM
+— which is exactly what agent-sandbox's `Sandbox`/`SandboxClaim`/
+`SandboxTemplate`/`SandboxWarmPool` CRDs implement generically, instead of
+this repo reimplementing that lifecycle logic itself.
 
-**Why on-demand, not a warm pool.** `POOL_SIZE` defaults to `0`: no idle pods
-are kept around. The first `bash` call of a conversation waits ~3–5s for its
-pod to schedule and start; after that everything is instant. On a small node,
-not parking idle pods (each holding ~256Mi of requests) is worth the one-time
-wait. Raise `POOL_SIZE` to keep N pods pre-warmed if that first-call latency
-matters.
-
-**Why a hard cap and a TTL, not "keep exactly N alive".** Two knobs bound
-resource use:
-
-- `MAX_SANDBOXES` (default 6) — total agent pods never exceeds this. Past it,
-  `exec` returns **503** and the backend surfaces "sandbox unavailable"; the
-  conversation retries. This is a ceiling, not a target — the orchestrator
-  never creates a pod nobody asked for.
-- A pod is deleted when **either** it's been idle `IDLE_GC_MINUTES` (no bash
-  call) **or** it has simply existed `SANDBOX_TTL_MINUTES` (a hard lifetime,
-  even mid-conversation). Either way the conversation transparently gets a
-  fresh pod on its next call — same as an idle reap or a pod restart. The
-  workspace is ephemeral by design; the agent regenerates files.
-
-**Why the orchestrator is nearly stateless.** `thread_id → pod` lives in the
-pod's own **labels** (`jarvis.sandbox/thread`); the per-pod agent token is a
-literal **env var** on the pod. The in-memory map is just a cache — on restart
-the orchestrator lists the pods and re-adopts every running sandbox instead of
-orphaning it. No database, no leader election beyond "run one replica".
-
-**Trust between orchestrator and agent.** The orchestrator injects a random
-`AGENT_TOKEN` per pod and replays it on every call; the agent rejects
-mismatches. A bash command can read the token out of its own environ, but it's
-scoped to that one pod — useless elsewhere. No long-lived shared secret ever
-lands inside a sandbox.
+**Reattaching to the same pod across a conversation's `bash` calls.**
+jarvis-backend labels each `SandboxClaim` with the conversation's
+`thread_id` at creation, and looks it up the same way on later calls
+(`list_all_sandboxes(label_selector=...)`) — Kubernetes is the source of
+truth for "does this conversation have a sandbox", no separate database.
+See that module's docstring for the full design writeup.
 
 ---
 
 ## How to start
 
-### Local dev (agent role only — no cluster)
+### Local dev — no cluster
 
-Runs bash in a local directory. No isolation, no pool — fine for one
-developer, same posture as the old `UNSAFE_NO_JAIL`. The orchestrator role
-needs a real cluster.
+Runs the same server a real agent-sandbox pod runs, just against a local
+directory instead of a k8s-managed `emptyDir`. No isolation — fine for one
+developer.
 
 ```bash
 make install-dev
-cp .env.example .env          # SANDBOX_ROLE=agent, AGENT_TOKEN empty
+cp .env.example .env
 make dev                      # -> http://localhost:8003
 ```
 
 ```bash
-curl -s localhost:8003/api/v1/sandbox/exec \
+curl -s localhost:8003/execute \
   -H 'content-type: application/json' \
   -d '{"command":"echo hi > note.txt && cat note.txt && pwd"}'
 ```
 
-`make test` runs the suite (`pytest`): agent runner (exec, timeout,
-truncation, `read_file` containment — relative *and* `/workspace/...` forms)
-and the pool logic against a fake k8s client (on-demand create, reuse,
-capacity cap, idle GC, TTL, restart reconcile, warm pool when `POOL_SIZE>0`).
+`make test` runs the suite (`pytest`): the exec/timeout/truncation logic and
+`read_file`/`write_file` path containment (relative *and* `/workspace/...`
+forms) in `app/agent/runner.py`.
 
-### In-cluster (the real thing)
-
-Prereqs: a running cluster with `kubectl` context set, `jarvis` namespace,
-`jarvis-secrets` holding `INTERNAL_API_KEY`. For NetworkPolicy enforcement the
-cluster needs a policy-aware CNI (`minikube start --cni=calico`); without it
-the policy is inert but harmless.
+### Building the image for a real cluster
 
 ```bash
-# 1. build + load the image (node runs cri-dockerd, so `docker images` on the
-#    node is enough; --provenance=false avoids an OCI-manifest-list that
-#    `minikube image load` mishandles)
-docker build --provenance=false -t jarvis-sandbox:<tag> .
-minikube image load jarvis-sandbox:<tag>
-
-# 2. point the overlay at that tag (quote it — a bare 7-hex is YAML sci-notation)
-cd ../jarvis-deploy && (cd sandbox/overlays/test && kustomize edit set image jarvis-sandbox=jarvis-sandbox:<tag>)
-
-# 3. apply
-kubectl apply -k sandbox/overlays/test
-kubectl -n jarvis rollout status deploy/sandbox
+# --provenance=false avoids an OCI-manifest-list some registries mishandle
+docker build --provenance=false -f Dockerfile.agentsandbox \
+  --build-arg BASE_IMAGE=<current-tag-of-the-plain-Dockerfile-build> \
+  -t <your-registry>/jarvis-sandbox:agentsandbox-<tag> .
 ```
 
-Normally CI does 1–2: the `Jenkinsfile` builds one image, pushes it to the
-in-cluster registry and bumps `sandbox/overlays/test/kustomization.yaml`;
-ArgoCD app `jarvis-sandbox` then auto-syncs. The orchestrator reads its **own**
-running image off the k8s API and starts agent pods with the same tag, so CI
-only ever bumps the one Deployment image.
-
-### From a stopped cluster
-
-```bash
-minikube start -p minikube                 # ArgoCD re-syncs everything
-kubectl -n jarvis rollout restart deploy/keycloak   # it often crashloops once on DNS
-# see the "Start Jarvis test cluster" note for the insecure-registry gotcha
-```
-
-### Verify
-
-```bash
-kubectl -n jarvis port-forward svc/sandbox 18080:8000 &
-KEY=$(kubectl -n jarvis get secret jarvis-secrets -o jsonpath='{.data.INTERNAL_API_KEY}' | base64 -d)
-
-curl -s localhost:18080/api/v1/admin/pods            # {threads:{}, pool_size:0, max_sandboxes:6, ttl_minutes:180, ...}
-curl -s localhost:18080/api/v1/sandbox/exec -H "X-Internal-Api-Key: $KEY" \
-  -H content-type:application/json \
-  -d '{"thread_id":"t1","command":"python3 -c \"print(6*7)\" && whoami"}'
-kubectl -n jarvis get pods -l app=jarvis-sandbox-agent -L jarvis.sandbox/state,jarvis.sandbox/thread
-```
+`Dockerfile.agentsandbox` is a thin layer on top of the plain `Dockerfile`
+(same toolchain, just swaps the entrypoint) — build the base image first
+with the plain `Dockerfile`, then this one on top with `--build-arg
+BASE_IMAGE=...` pointing at it. See
+[AGENTSANDBOX-MIGRATION.md](AGENTSANDBOX-MIGRATION.md) for the full
+Template/WarmPool YAML this image is meant to run under, and
+[DEPLOY-STANDALONE.md](DEPLOY-STANDALONE.md) for a complete from-zero
+walkthrough (install agent-sandbox itself, build this image, wire up RBAC)
+on a cluster that's never had any of this before.
 
 ---
 
-## How to use it (the request lifecycle)
+## What the image actually serves
 
-jarvis-backend never changed — it calls the same three routes, keyed by
-`thread_id`, behind `X-Internal-Api-Key`. What happens under each:
+`app/agent/agentsandbox_server.py` — matches agent-sandbox's own runtime
+contract (**not** jarvis-sandbox's own protocol from before the cutover):
 
-| route | caller | what the orchestrator does |
-|---|---|---|
-| `POST /api/v1/sandbox/exec` `{thread_id, command, timeout_seconds?}` | backend `bash` tool | **claim**: reuse this thread's pod if it's Ready, else create one (up to `MAX_SANDBOXES`, else 503), relabel it `claimed`/`thread=<id>`, then proxy the command to `http://<podIP>:8000` with the pod's `AGENT_TOKEN`. Returns `{stdout, stderr, exit_code, timed_out}`. |
-| `GET /api/v1/sandbox/read?thread_id=&name=` | `present_file` / chat download chip | look up this thread's pod, proxy the read. `name` may be relative (`report.docx`) or the `/workspace/...` form — both resolve to the same file; `..` / paths outside `/workspace` / symlinks out are rejected. |
-| `POST /api/v1/sandbox/reset` `{thread_id}` | `/chat/stop`, conversation delete | **release**: delete the pod, forget the mapping. Idempotent. |
-| `GET /api/v1/health` | k8s probes | liveness |
-| `GET /api/v1/admin/pods` | debugging, in-cluster only, no auth | current `thread → pod` map + effective limits |
+| route | what it does |
+|---|---|
+| `GET /` | health check (readiness/liveness probe, and how the SDK knows a claimed pod is up) |
+| `POST /execute` `{command}` | runs the command in `/workspace`, returns `{stdout, stderr, exit_code}` |
+| `POST /upload` (multipart, field `file`) | writes the uploaded content under `/workspace` |
+| `GET /download/<path>` | reads a file back out from `/workspace` |
 
-Files a command writes under `/workspace` (or a plain relative path — same
-thing) persist for the life of that pod, i.e. across bash calls in the
-conversation, until an idle reap / the TTL / a `reset`.
-
----
-
-## What improved vs. the shared container
-
-| | old (shared container) | now (pod per conversation) |
-|---|---|---|
-| kernel | one, shared by all conversations | still shared (host kernel) — `SANDBOX_RUNTIME_CLASS=gvisor` for a per-sandbox kernel |
-| network | pod netns shared; could reach every in-cluster Service | own netns + NetworkPolicy: **no egress except DNS** |
-| toolchain | writable site-packages, `pip install` at runtime | fixed offline set baked in; pip / uv removed; read-only rootfs |
-| resource limits | tmpfs sizes + wall-clock only | per-pod cpu / memory / ephemeral-storage limits |
-| privileges | service ran as **root + `CAP_SYS_ADMIN`** | everything unprivileged, all caps dropped, seccomp RuntimeDefault |
-| blast radius of an escape | root in a `CAP_SYS_ADMIN` pod | unprivileged uid in a locked-down, disposable pod |
-| lifetime bound | idle GC only | idle GC **and** a hard TTL |
-
-### Still open
-
-- **Shared host kernel.** A kernel LPE still crosses pods. `SANDBOX_RUNTIME_CLASS=gvisor`
-  closes it; needs the RuntimeClass installed on the cluster (follow-up overlay).
-- **NetworkPolicy needs a policy-aware CNI** (`--cni=calico`). Inert otherwise —
-  the read-only rootfs + stripped pip still block installs, but egress isn't
-  cut until the CNI enforces it.
-- **Image is ~3.5 GB** (offline: the whole toolchain plus NLTK corpora are
-  baked in). Pulled once per node; keep `POOL_SIZE` small if you raise it.
-- **First-call latency** ~3–5s (on-demand pod start) — raise `POOL_SIZE` to hide it.
-- Workspace is an `emptyDir` — a pod restart / GC / TTL loses it, `present_file`
-  links 404 after. Expected; the agent regenerates files.
+Files written under `/workspace` (or a plain relative path — same thing)
+persist for the life of that pod, i.e. across `bash` calls in the same
+conversation, until agent-sandbox reclaims it (idle GC / TTL / an explicit
+`delete_sandbox()` from jarvis-backend's `reset()`).
 
 ---
-
-## Config (`.env` / ConfigMap `sandbox-config`)
-
-Consumed by the **orchestrator**. Agent pods get their env from the pod spec
-the orchestrator writes ([app/orchestrator/podspec.py](app/orchestrator/podspec.py)),
-derived from these same values — one source of truth.
-
-| var | default | meaning |
-|---|---|---|
-| `SANDBOX_ROLE` | `agent` | `orchestrator` or `agent` |
-| `INTERNAL_API_KEY` | — | shared secret with jarvis-backend (orchestrator checks it) |
-| `POD_NAMESPACE` | `jarvis` | namespace agent pods are created in |
-| `SANDBOX_IMAGE` | *(empty)* | agent-pod image; empty → orchestrator reads its own running image off the k8s API |
-| `POOL_SIZE` | `0` | pods kept pre-warmed; `0` = pure on-demand |
-| `MAX_SANDBOXES` | `6` | hard ceiling on total agent pods (past it → 503) |
-| `IDLE_GC_MINUTES` | `30` | reap a sandbox no `exec` touched for this long |
-| `SANDBOX_TTL_MINUTES` | `180` | hard per-pod lifetime, even if still active |
-| `CLAIM_TIMEOUT_SECONDS` | `40` | wait budget for a new pod to become Ready |
-| `COMMAND_TIMEOUT_SECONDS` | `300` | per-command wall-clock limit (agent) |
-| `SANDBOX_CPU_*` / `SANDBOX_MEM_*` | see `.env.example` | agent pod requests/limits |
-| `SANDBOX_WORKSPACE_SIZE` / `SANDBOX_TMP_SIZE` | `2Gi` / `1Gi` | emptyDir size caps |
-| `SANDBOX_RUNTIME_CLASS` | *(empty)* | e.g. `gvisor` for a per-sandbox kernel |
-
-Agent-only (set by the orchestrator, or `.env` locally): `WORKSPACE_DIR`
-(`/workspace`), `AGENT_TOKEN` (per-pod bearer token; empty disables the check).
-
----
-
-## Deploy (k8s)
-
-Manifests in `jarvis-deploy/sandbox/`:
-
-- `orchestrator.yaml` — ServiceAccount + Role (`pods: get/list/watch/create/
-  delete/patch`) + RoleBinding, the `sandbox` Deployment (replicas 1,
-  `Recreate` — exactly one orchestrator, or two race on pod management), the
-  `sandbox` Service (name unchanged, so backend's `SANDBOX_SERVICE_URL` is
-  untouched).
-- `networkpolicy.yaml` — locks the agent pods down. **Needs a policy-aware CNI.**
-- `configmap.yaml` — `sandbox-config`.
-
-ArgoCD app `jarvis-sandbox` auto-syncs `sandbox/overlays/test`.
 
 ## The image
 
@@ -254,7 +136,18 @@ toolchain: numpy, pandas, scipy, statsmodels, pyarrow, scikit-learn, xgboost,
 lightgbm, matplotlib, seaborn, plotly, nltk (+ common corpora bundled),
 beautifulsoup4/lxml, python-docx, python-pptx, openpyxl, xlsxwriter, reportlab,
 fpdf2, pillow, jinja2, and `pandoc`. Runs as uid 1000. **`pip` and `uv` are
-removed** and the agent pod's rootfs is read-only, so the environment can't be
-changed at runtime — to add a library, add it to the `Dockerfile` and rebuild.
-Cache dirs (matplotlib, fontconfig, …) are pointed at `/tmp`. ~3.5 GB; `COPY
-app` is last so app-only changes rebuild in seconds.
+removed** and the pod's rootfs is read-only, so the environment can't be
+changed at runtime — to add a library, add it to the `Dockerfile` and
+rebuild. Cache dirs (matplotlib, fontconfig, …) are pointed at `/tmp`.
+~3.5 GB; `COPY app` is last so app-only changes rebuild in seconds.
+
+## Config (`.env`)
+
+| var | default | meaning |
+|---|---|---|
+| `WORKSPACE_DIR` | `/workspace` | the one directory the command sees — an emptyDir in k8s (mounted by the SandboxTemplate), any writable dir locally |
+
+Everything else (how many pods, warm-pool size, resource limits, TTL, RBAC,
+NetworkPolicy) lives in the `SandboxTemplate`/`SandboxWarmPool` YAML and
+jarvis-backend's `AGENTSANDBOX_NAMESPACE`/`AGENTSANDBOX_WARMPOOL` settings —
+not in this repo. See AGENTSANDBOX-MIGRATION.md.

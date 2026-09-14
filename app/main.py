@@ -1,23 +1,15 @@
-"""Entrypoint. One image, two roles — `SANDBOX_ROLE` picks which FastAPI app
-gets built. `uvicorn app.main:app` works for both (k8s Deployment for the
-orchestrator, the pod spec the orchestrator writes for each agent).
+"""Entrypoint. jarvis-sandbox's own orchestrator/agent split is gone
+(decommissioned 2026-09-14 — real traffic moved to kubernetes-sigs/agent-sandbox,
+see AGENTSANDBOX-MIGRATION.md) — this image now only ever runs the
+agent-sandbox adapter, `app.agent.agentsandbox_server`. `uvicorn app.main:app`
+and `Dockerfile.agentsandbox`'s own CMD both resolve to the same app object.
 """
 
 import logging
 
-from app.core.config import settings
+from app.agent.agentsandbox_server import app  # noqa: F401 — re-exported for `uvicorn app.main:app`
 
-# uvicorn only configures its own loggers; make our `logging.getLogger(__name__)`
-# calls (pool claim/refill/GC, k8s config source) actually show up in `kubectl
-# logs`.
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s %(levelname)s %(name)s %(message)s",
 )
-
-if settings.SANDBOX_ROLE == "orchestrator":
-    from app.orchestrator.app import build_app
-else:
-    from app.agent.app import build_app
-
-app = build_app()

@@ -1,12 +1,9 @@
-"""Alternate entrypoint: exposes `app.agent.runner`'s existing bash-exec
-logic through kubernetes-sigs/agent-sandbox's own runtime contract (GET /
-health check, POST /execute) instead of jarvis-sandbox's own
-`/api/v1/sandbox/*` protocol.
-
-Not wired into `app.main`'s SANDBOX_ROLE dispatch — this is a standalone
-image/entrypoint for evaluating agent-sandbox as a possible backend, run
-via Dockerfile.agentsandbox, side by side with the real jarvis-sandbox
-deployment (different image tag, different SandboxTemplate).
+"""Exposes `app.agent.runner`'s bash-exec logic through kubernetes-sigs/
+agent-sandbox's own runtime contract (GET / health check, POST /execute) —
+the entrypoint `app.main` imports directly, and what `Dockerfile.agentsandbox`
+also points its own CMD at. jarvis-sandbox's old `/api/v1/sandbox/*`
+protocol (the orchestrator/agent split this replaced) is gone — see
+AGENTSANDBOX-MIGRATION.md for the 2026-09-14 cutover.
 
 Request/response shape here matches the *installed* `k8s-agent-sandbox`
 pip package's actual wire format, not the docs site (which describes an

@@ -14,7 +14,8 @@ install-dev:
 	python3 -m venv $(VENV)
 	$(PIP) install -q -r requirements-dev.txt
 
-# Local dev = the "agent" role: bash in WORKSPACE_DIR, no cluster, no isolation.
+# Local dev: bash in WORKSPACE_DIR, no cluster, no isolation — same server
+# that runs inside a real agent-sandbox pod (app.agent.agentsandbox_server).
 run:
 	$(UVICORN) app.main:app --host 0.0.0.0 --port 8003
 

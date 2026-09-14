@@ -1,9 +1,4 @@
-import os
-
 import pytest
-
-os.environ.setdefault("SANDBOX_ROLE", "agent")
-
 from app.agent import runner
 from app.core.config import settings
 
