@@ -1,30 +1,25 @@
 # Migrating jarvis-sandbox to kubernetes-sigs/agent-sandbox
 
-Plan + verified setup for replacing jarvis-sandbox's own orchestrator/pod-pool
-with [kubernetes-sigs/agent-sandbox](https://agent-sandbox.sigs.k8s.io/docs/).
-Phase 1 is done and verified live. Phase 2 steps A, B, and C are done, and as
-of 2026-09-13 all three are **committed and shipped to both repos' main
-branches**, having gone through the real Jenkins → ArgoCD pipeline into the
-production `jarvis` namespace:
+**Status: done.** As of 2026-09-14, real jarvis traffic runs entirely on
+[kubernetes-sigs/agent-sandbox](https://agent-sandbox.sigs.k8s.io/docs/).
+jarvis-sandbox's own orchestrator (the Deployment that used to create/track/
+delete agent pods itself) has been decommissioned — deleted from the
+cluster, its GitOps manifests removed, and its code deleted from this repo.
+`jarvis-backend/app/agents/tools/sandbox_manager.py` talks to agent-sandbox's
+controller directly; there is no flag, no fallback, no dispatcher — this
+*is* the sandbox backend now.
 
-- `jarvis-sandbox` commit `33767e2` (Phase 2 A+C — hardened adapter image +
-  `/upload`/`/download` filesystem endpoints) — live in the real `sandbox`
-  Deployment's pod.
-- `jarvis-backend` commit `d26a1b9` (Phase 2 B — `sandbox_manager_agentsandbox.py`)
-  — live in the real `backend` Deployment's pod.
-
-**This is code being live, not behavior changing.** Nothing here is on any
-live request path: `sandbox_manager_agentsandbox.py` isn't imported by any
-tool, `agentsandbox_server.py` only runs under `Dockerfile.agentsandbox`
-which no Jenkinsfile builds (the default `Dockerfile` does, unchanged
-entrypoint), and jarvis-backend has no RBAC to talk to agent-sandbox's CRDs.
-The two production Deployments behave exactly as before this push — only
-their images now happen to contain this additional, inert code (plus two
-small genuinely-shared additions: `runner.py`'s `write_file()`/
-`_resolve_in_workspace()` helpers, and `python-multipart` in
-`requirements.txt`). The cutover (step F) — the point where any of this
-starts actually being called — is still not started, deliberately, left for
-whoever's ready to do it with eyes open.
+This doc is kept as the history of how that happened — Phase 1 (install +
+sanity-check agent-sandbox itself), Phase 2 A–F (harden it, adapt
+jarvis-backend, wire it in, benchmark it, GitOps it, cut traffic over, tear
+the old thing down). Read top to bottom for the story, or jump to
+[Phase 2 step F](#f-cutover--done-2026-09-14-jarvis-sandboxs-own-orchestrator-no-longer-exists)
+for what the actual cutover looked like and what got deleted.
+If you're standing this up somewhere new rather than reading history, see
+[DEPLOY-STANDALONE.md](DEPLOY-STANDALONE.md) instead — though note that doc
+was written *before* this cutover and still frames jarvis-sandbox's own
+orchestrator as "the current system"; the agent-sandbox setup described in
+this doc is what's actually running today.
 
 ## Phase 1 — verified working
 
@@ -377,7 +372,7 @@ Only do this if abandoning the migration — Phase 2 needs the install kept
 
 ---
 
-## Phase 2 — production migration (A–E done, F wired but not flipped)
+## Phase 2 — production migration (A–F all done — this is complete)
 
 Concrete plan, in dependency order. Each step is independently verifiable
 — A, C, and the core of B have now actually been verified live (not just
@@ -638,46 +633,61 @@ Gotchas): the registry `access forbidden` bug reproduces through a real
 Jenkins-built push — whoever sets this job up should expect to hit it and
 have the `minikube image load` recovery ready, not be surprised by it.
 
-### F. Cutover — **dispatcher wired, flag off; RBAC pending; in-cluster path still unverified**
+### F. Cutover — **done, 2026-09-14. jarvis-sandbox's own orchestrator no longer exists.**
 
-`jarvis-backend` commits `34fd2d8` + `7a2df3b` (not yet pushed) turn
-`sandbox_manager.py` into a dispatcher keyed on a new `SANDBOX_BACKEND`
-setting (`"legacy"` default, `"agentsandbox"` the switch) —
-`sandbox_manager_legacy.py` is the old client, byte-for-byte, under a new
-name; `sandbox_manager_agentsandbox.py` (step B) is now actually
-selectable. Every call site (`bash.py`, `present_file.py`, `files.py`,
-`web_search.py`, `web_fetch.py`, `sandbox_save.py`, `chat_service.py`,
-`conversation_service.py`, `chat.py`, `main.py`) is unchanged — none of
-them know which backend is live.
+What actually happened, in order:
 
-**Verified locally:** with the default flag, the dispatcher resolves to
-the legacy backend and the `agentsandbox` module is never imported — a
-deploy of this commit alone, even without `k8s-agent-sandbox` installed
-yet, starts up and behaves exactly as before. With the flag flipped, the
-module import is attempted lazily and fails with a clear `ImportError`
-(not a crash) if the dependency is missing — confirmed both branches by
-hand, not just by reading the code.
+1. RBAC applied (`ServiceAccount jarvis-backend` in `jarvis`, `Role`/
+   `RoleBinding jarvis-backend-agentsandbox` in `default`) — hit a real bug
+   doing this: both rules were written under `extensions.agents.x-k8s.io`,
+   but `sandboxes` is the **core** CRD (`agents.x-k8s.io`), not an
+   extension one. `kubectl apply` accepted the wrong Role silently; only
+   `kubectl auth can-i get sandboxes ...` caught the gap. Fixed live,
+   documented in the Phase 2 B section above.
+2. `backend` Deployment got `serviceAccountName: jarvis-backend` (via
+   jarvis-deploy, not a raw `kubectl patch` — `backend`'s ArgoCD
+   Application has `selfHeal: true`, which would've reverted a direct
+   patch on the next sync).
+3. **The one thing that mattered most, finally verified**: `exec_bash()`
+   through the real dispatcher, from the real `backend` pod, with the real
+   RBAC, `SANDBOX_BACKEND` overridden just for that one call
+   (`kubectl exec ... env SANDBOX_BACKEND=agentsandbox python3 -c ...`) —
+   created a claim, ran `python3 -c "print(6*7)" && whoami && hostname`,
+   got `42` / `sandbox` / the real pod name back, clean exit.
+4. `SANDBOX_BACKEND=agentsandbox` set for real in `backend-config`
+   (jarvis-deploy), rolled out, confirmed live in the running pod's actual
+   environment (not an override).
+5. Smoke-tested the real `bash` tool itself (not just `exec_bash()`
+   directly) through the naturally-configured pod — clean output, no
+   manual overrides.
+6. **Old orchestrator decommissioned**: `Deployment`/`Service sandbox`,
+   its `ConfigMap`, its `NetworkPolicy`, its `ServiceAccount`/`Role`/
+   `RoleBinding` (`jarvis-sandbox-orchestrator`) all deleted from the
+   cluster; the ArgoCD Application removed first so `selfHeal` didn't
+   fight the cleanup. `jarvis-deploy`'s `sandbox/overlays/test/` and
+   `argocd/sandbox-application.yaml` removed from git.
+   `sandbox_manager.py` collapsed back to a single direct implementation —
+   no more dispatcher, no more `SANDBOX_BACKEND` flag, since there's
+   nothing left to switch between. `jarvis-sandbox`'s own
+   `app/orchestrator/` and the old `/api/v1/sandbox/*` protocol
+   (`app/agent/app.py`) deleted too — see that repo's own commit history.
 
-**Blocked, needs a human:** applying the RBAC (see step E) — an agent
-session isn't allowed to self-grant new k8s permissions, by design, and
-shouldn't be. Whoever does this next needs to `kubectl apply` it, then
-push both `jarvis-backend` (2 commits) and `jarvis-deploy` (1 commit) —
-another action needing a human's git credentials, not an agent's.
+**One real production incident found and fixed along the way, unrelated to
+any of the above but worth recording**: the old orchestrator had been
+silently down for 13 hours (`ImagePullBackOff` on a docs-only image build
+— the same registry `access forbidden` bug hit again, this time via a real
+Jenkins-triggered rebuild, nobody had applied the `minikube image load`
+recovery). Found and fixed while checking the rollback path was healthy
+before relying on it. Nobody had noticed — a reminder that "rollback is
+just flipping a flag back" is only true if the thing you'd flip back to
+is actually still alive.
 
-**Still unverified — the one thing that matters most before flipping real
-traffic:** `SandboxInClusterConnectionConfig` actually working end-to-end
-*through this exact dispatcher path*, from inside the cluster, with the
-real RBAC. Everything verified so far (step B, step D above) used the SDK
-directly from outside the cluster (Tunnel mode) or the claim-management
-calls, which work identically regardless of connection mode. Once RBAC is
-applied and both repos are pushed, the next step is a throwaway pod (same
-new ServiceAccount, same image, `SANDBOX_BACKEND=agentsandbox`) running
-`sandbox_manager.exec_bash()` for real — *before* touching the real
-`backend` Deployment's ConfigMap. Only after that succeeds does flipping
-`SANDBOX_BACKEND` on the real Deployment become a "flip a ConfigMap value,
-watch it, flip it back if wrong" operation instead of a leap of faith.
-
-Decommissioning jarvis-sandbox's own orchestrator Deployment is still the
-very last step, after real traffic has run on the new backend long enough
-to trust it — not something to do as a side effect of getting the plumbing
-in place.
+**Deliberately not touched**: `jarvis-deploy`'s `sandbox/base/` and
+`sandbox/overlays/staging/` — still referenced by
+`argocd/staging-sandbox-application.yaml`, which targets a **separate
+cluster** (`destination.server: host.minikube.internal:18443`) that was
+unreachable (`sync: Unknown`) at cutover time. Deleting that path would
+prune that cluster's entire `jarvis` namespace next time it reconnects,
+with no way to verify anything about it from here. If staging is also
+moving off the old orchestrator, that's a separate decommission someone
+with visibility into that environment needs to do.
