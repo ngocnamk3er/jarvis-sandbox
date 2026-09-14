@@ -10,13 +10,20 @@ controller directly; there is no flag, no fallback, no dispatcher — this
 *is* the sandbox backend now.
 
 This doc is kept as the history of how that happened — Phase 1 (install +
-sanity-check agent-sandbox itself), Phase 2 A–F (harden it, adapt
+sanity-check agent-sandbox itself), Phase 2 A–G (harden it, adapt
 jarvis-backend, wire it in, benchmark it, GitOps it, cut traffic over, tear
-the old thing down). Read top to bottom for the story, or jump to
+the old thing down, then close an auth regression the cutover introduced).
+Read top to bottom for the story, or jump to
 [Phase 2 step F](#f-cutover--done-2026-09-14-jarvis-sandboxs-own-orchestrator-no-longer-exists)
-for what the actual cutover looked like and what got deleted. For the
-practical "how is this actually deployed, what do I run to redo it", skip
-straight to [Current deployment](#current-deployment) below.
+for what the actual cutover looked like and what got deleted, or
+[step G](#g-security-hardening--router--tokenreview-auth-done-2026-09-15-residual-gap-knowingly-accepted)
+for a known, user-accepted gap: direct sandbox-pod-to-sandbox-pod access
+is still unauthenticated (router auth only covers jarvis-backend's own
+traffic) — normal per-conversation usage is confirmed isolated, but a
+sandbox that's been made to run adversarial code could still reach another
+conversation's sandbox directly. For the practical "how is this actually
+deployed, what do I run to redo it", skip straight to
+[Current deployment](#current-deployment) below.
 
 > [DEPLOY-STANDALONE.md](DEPLOY-STANDALONE.md) is now **stale** — it was
 > written before this cutover for a different audience (deploying
@@ -172,28 +179,59 @@ subjects:
   - {kind: ServiceAccount, name: jarvis-backend, namespace: jarvis}
 ```
 
+This RBAC (unchanged since Phase 2 step F) covers jarvis-backend's direct
+k8s-API calls (create/list/get/delete on `sandboxclaims`/`sandboxes`). It
+now does double duty as router authentication too — see step G below —
+because jarvis-backend sends this same ServiceAccount's projected token as
+the bearer credential the router validates via TokenReview. No separate
+secret was provisioned for that; the router itself needs its own RBAC
+(`sandbox-router` ServiceAccount + Pod-read ClusterRole +
+`system:auth-delegator`), tracked in `jarvis-deploy`'s
+`agent-sandbox-router/` alongside its Deployment — see step G.
+
 **ServiceAccount wiring** — `jarvis-deploy/backend/base/backend.yaml`'s
 `template.spec.serviceAccountName: jarvis-backend` (GitOps'd like any other
 Deployment field — no reason this one needs to be manual).
 
 **Code** — `jarvis-backend/app/agents/tools/sandbox_manager.py` is the
 entire client, no flag/dispatcher (removed once the old orchestrator was
-gone — see Phase 2 step F). The shape any call site actually uses:
+gone — see Phase 2 step F). Reversed once more on 2026-09-15, for security
+not convenience — see [step G](#g-security-hardening--router--tokenreview-auth-done-2026-09-15-residual-gap-knowingly-accepted)
+below for why it now goes through the router with a bearer token instead of
+straight to the pod. The shape any call site actually uses:
 
 ```python
 # app/agents/tools/sandbox_manager.py
 from k8s_agent_sandbox import AsyncSandboxClient
-from k8s_agent_sandbox.models import SandboxInClusterConnectionConfig
+from k8s_agent_sandbox.models import SandboxDirectConnectionConfig
+
+_ROUTER_URL = "http://sandbox-router-svc.agent-sandbox-system.svc.cluster.local:8080"
+_SA_TOKEN_PATH = "/var/run/secrets/kubernetes.io/serviceaccount/token"
+
+def _auth_headers() -> dict[str, str]:
+    with open(_SA_TOKEN_PATH) as f:
+        return {"Authorization": f"Bearer {f.read().strip()}"}
 
 def init_client() -> None:
     global _client
     _client = AsyncSandboxClient(
-        connection_config=SandboxInClusterConnectionConfig(server_port=8888),
+        connection_config=SandboxDirectConnectionConfig(api_url=_ROUTER_URL, server_port=8888),
     )
+
+async def _get_or_create_sandbox(thread_id: str):
+    ...  # claims by thread_id label, reuses if it exists
+    # no first-class SDK support for custom headers on this connection mode —
+    # sandbox.connector.client is a real, shared, settable httpx.AsyncClient
+    sandbox.connector.client.headers.update(_auth_headers())
+    return sandbox
 
 async def exec_bash(thread_id: str, command: str) -> dict:
     """Returns {stdout, stderr, exit_code, timed_out}."""
-    sandbox = await _get_or_create_sandbox(thread_id)  # claims by thread_id label, reuses if it exists
+    sandbox = await _get_or_create_sandbox(thread_id)
+    # generic templates run commands via shlex.split()+subprocess, not a
+    # real shell — wrap so &&/|/>/heredocs work regardless of backend image
+    wrapped = "bash -c " + shlex.quote(command)
+    result = await sandbox.commands.run(wrapped, timeout=300)
     ...
 
 async def read_file(thread_id: str, name: str) -> tuple[bytes, str, str]: ...
@@ -215,8 +253,16 @@ adding a new call site that reads files.
 
 ```python
 AGENTSANDBOX_NAMESPACE: str = "default"
-AGENTSANDBOX_WARMPOOL: str = "jarvis-agentsandbox-pool"
+AGENTSANDBOX_WARMPOOL: str = "python-sandbox-pool"
 ```
+
+`AGENTSANDBOX_WARMPOOL` points at agent-sandbox's own stock generic
+template (`python-sandbox-pool`, backed by `python-runtime-sandbox`), not
+jarvis's own `Dockerfile.agentsandbox`-built image/pool
+(`jarvis-agentsandbox-pool`, from Phase 2 step D) — a deliberate choice
+made mid-session to compare the two; both templates work through this
+client, switching back is just this one ConfigMap key in
+`jarvis-deploy/backend/base/configmap.yaml`.
 
 **Dependency** (`requirements.txt`): `k8s-agent-sandbox[async]==1.0.2` —
 hard requirement now, not conditional on anything.
@@ -923,3 +969,95 @@ prune that cluster's entire `jarvis` namespace next time it reconnects,
 with no way to verify anything about it from here. If staging is also
 moving off the old orchestrator, that's a separate decommission someone
 with visibility into that environment needs to do.
+
+### G. Security hardening — router + TokenReview auth (done, 2026-09-15); residual gap knowingly accepted
+
+**What was found.** The old (now-deleted) orchestrator authenticated every
+sandbox call with a per-pod `AGENT_TOKEN`, checked server-side by
+`app/agent/app.py`'s `verify_agent_token`. That code was deleted in the
+cutover (step F) along with the rest of the orchestrator, and nothing
+replaced it: both `agentsandbox_server.py` (jarvis's own adapter) and
+agent-sandbox's own stock `python-runtime-sandbox/main.py` accept every
+request on `GET /`, `POST /execute`, `POST /upload`, `GET /download/<path>`
+with **zero authentication** — by design, per upstream's own model, which
+puts the security boundary at NetworkPolicy + the router, not the pod
+itself. Neither of those was actually in place here: this cluster's CNI
+doesn't enforce NetworkPolicy at all (confirmed repeatedly over the course
+of this migration — the controller's own `networkPolicyManagement: Managed`
+auto-creates per-Template NetworkPolicies that are equally inert), and
+jarvis-backend was calling pods directly
+(`SandboxInClusterConnectionConfig`) rather than through the router,
+because the *deployed* router image
+(`sandbox-router:latest-main`) was an old Python build with no pod-IP
+cache and no authz framework — going through it just 502'd.
+
+Confirmed live, from inside one conversation's sandbox pod, with no
+credentials of any kind: a direct HTTP call to a second live sandbox pod's
+IP on `:8888` could read that second pod's files (`GET /download/<path>`)
+**and** run arbitrary commands in it (`POST /execute`). Any conversation's
+sandbox could fully compromise any other conversation's sandbox, just by
+knowing (or scanning for) its pod IP. This is a regression introduced by
+the cutover, not a pre-existing gap in the old system.
+
+**What normal usage was checked separately, and is fine**: two real
+conversations (`thread_id` A and B), each running the actual `bash` tool
+through the actual API — `ls -la` in A never sees B's files. The
+compromise above requires code *inside* a sandbox pod to deliberately
+reach out to another pod's IP; it does not happen as a side effect of
+ordinary tool calls, and nothing in the model's own prompt/tools does
+this. The vulnerability is real but requires an adversarial payload
+running inside a sandbox (e.g. from a prompt injection in fetched content,
+or attacker-supplied code the model executes) — not baseline exposure.
+
+**Fix implemented**: agent-sandbox's `sandbox-router` has a full built-in
+authorization framework (`--authz-mode=allow-all|tokenreview|scoped-token`,
+see `sandbox-router`'s own README) that the cutover had simply bypassed.
+Rebuilt the router from the `v1.0.2` Go source (already vendored for the
+controller/CRDs) with `--authz-mode=tokenreview
+--authz-tokenreview-require-token=true --cache-enabled=true` (the cache is
+what actually fixes the 502s the old staging image had, as a side
+benefit), GitOps'd in `jarvis-deploy/agent-sandbox-router/` (Deployment +
+kustomization + `argocd/agent-sandbox-router-application.yaml`), with its
+RBAC (`ServiceAccount sandbox-router` + Pod-read `ClusterRole` +
+`system:auth-delegator` `ClusterRoleBinding`, needed for the TokenReview
+API call itself) applied by hand the same way jarvis-backend's own RBAC
+is — a permission grant, deliberately not GitOps'd. `sandbox_manager.py`
+switched from `SandboxInClusterConnectionConfig` to
+`SandboxDirectConnectionConfig` pointed at the router's in-cluster
+Service, sending jarvis-backend's own projected ServiceAccount token
+(the one already granted `sandboxclaims`/`sandboxes` RBAC) as
+`Authorization: Bearer <token>` — no new secret, same identity doing
+double duty. See the [Current deployment](#current-deployment) section's
+jarvis-backend code block for the actual shape (`_auth_headers()`,
+`sandbox.connector.client.headers.update(...)` — no first-class SDK field
+for this on `SandboxDirectConnectionConfig`, so it reaches into the
+shared `httpx.AsyncClient` directly).
+
+Verified live: unauthenticated calls to the router get `401`; the real
+`bash` tool, going through jarvis-backend's normal code path, still works.
+
+**What this fix does *not* close, confirmed by re-running the exact same
+attack after the fix was live**: routing jarvis-backend's own traffic
+through an authenticated router does nothing to stop one sandbox pod from
+reaching another sandbox pod's raw IP directly — that traffic never
+touches the router, so TokenReview never sees it. The direct pod-to-pod
+compromise described above **still works, unchanged, after this fix**.
+Actually closing it needs one of: NetworkPolicy enforcement at the
+cluster/CNI level (this minikube setup doesn't have that today, and
+switching CNI is disruptive well beyond this migration's scope), or
+authentication added to the sandbox pods' own HTTP servers
+(`agentsandbox_server.py` and/or a fork of the stock template) — real
+work, not a config flag.
+
+**Decision**: raised to the user 2026-09-15 along with the above tradeoffs.
+Explicit instruction received: leave it here — the legitimate-traffic path
+(jarvis-backend → router → pod) is authenticated, ordinary per-conversation
+usage is confirmed isolated, and the residual deliberate-attack vector
+(pod directly reaching another pod's IP) is a known, accepted risk, not
+scheduled for further work unless raised again. If revisiting this: the
+NetworkPolicy option is probably the smaller lift on a CNI that supports
+it (Cilium/Calico, not minikube's default), since it needs no image
+changes; the per-pod-auth option is more portable but means giving
+`agentsandbox_server.py` (and possibly forking the stock template image)
+its own token check again — effectively re-adding a scoped version of what
+the old orchestrator's `verify_agent_token` did.
