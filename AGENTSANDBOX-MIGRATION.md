@@ -537,9 +537,13 @@ connection mode — but the actual in-cluster HTTP path has not been
 exercised. That needs either a throwaway pod inside the cluster running
 this module, or wiring it into jarvis-backend for real (which also needs:
 a new RBAC Role/RoleBinding for jarvis-backend's ServiceAccount —
-`get`/`list`/`watch`/`create`/`delete` on `sandboxclaims` and
-`get`/`list`/`watch` on `sandboxes`, both in `extensions.agents.x-k8s.io`
-— it has none today, only talks HTTP to the orchestrator Service; and a
+`get`/`list`/`watch`/`create`/`delete` on `sandboxclaims`
+(`extensions.agents.x-k8s.io`) and `get`/`list`/`watch` on `sandboxes`
+(`agents.x-k8s.io` — the **core** CRD, a different apiGroup from the
+extension ones; mixing these up is an easy, silent mistake since `kubectl
+apply` accepts the Role either way and only `kubectl auth can-i` catches
+it — confirmed live 2026-09-14) — it has none today, only talks HTTP to
+the orchestrator Service; and a
 NetworkPolicy allowing jarvis-backend's pod → Sandbox pods on 8888,
 since InCluster mode bypasses the router entirely).
 
