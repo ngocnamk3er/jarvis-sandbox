@@ -118,65 +118,44 @@ plus building the router from source.
 
 ## Step 3 — Template + warm pool
 
-Upstream's stock runtime image. The warm pool keeps pods pre-started so a
-conversation's first command doesn't pay pod startup.
+Upstream ships both as templated YAML, so apply them directly rather than
+keeping your own copy:
 
 ```bash
-kubectl apply -f - <<'EOF'
-apiVersion: extensions.agents.x-k8s.io/v1beta1
-kind: SandboxTemplate
-metadata:
-  name: python-sandbox-template
-  namespace: default
-spec:
-  podTemplate:
-    spec:
-      containers:
-      - name: python-runtime
-        image: us-central1-docker.pkg.dev/k8s-staging-images/agent-sandbox/python-runtime-sandbox:latest-main
-        ports:
-        - containerPort: 8888
-        readinessProbe:
-          httpGet: {path: "/", port: 8888}
-          initialDelaySeconds: 0
-          periodSeconds: 1
-        livenessProbe:
-          httpGet: {path: "/", port: 8888}
-          initialDelaySeconds: 2
-          periodSeconds: 10
-        resources:
-          requests: {cpu: "250m", memory: "512Mi", ephemeral-storage: "512Mi"}
-      restartPolicy: OnFailure
-  volumeClaimTemplates:
-  - metadata: {name: workspace}
-    spec:
-      accessModes: ["ReadWriteOnce"]
-      resources: {requests: {storage: "1Gi"}}
-  volumeClaimTemplatesPolicy: Overrides
----
-apiVersion: extensions.agents.x-k8s.io/v1beta1
-kind: SandboxWarmPool
-metadata:
-  name: python-sandbox-pool
-  namespace: default
-spec:
-  replicas: 1
-  sandboxTemplateRef:
-    name: python-sandbox-template
-EOF
+VERSION=v1.0.2
+BASE=https://raw.githubusercontent.com/kubernetes-sigs/agent-sandbox/refs/tags/${VERSION}/clients/python/agentic-sandbox-client
+
+curl -sSL ${BASE}/python-sandbox-template.yaml \
+  | sed -e 's|${SANDBOX_NAMESPACE}|default|g' \
+        -e 's|${SANDBOX_TEMPLATE_NAME}|python-sandbox-template|g' \
+  | kubectl apply -f -
+
+# The warm pool ships replicas: 0, which pre-starts nothing.
+curl -sSL ${BASE}/python-sandbox-warmpool.yaml \
+  | sed -e 's|${SANDBOX_NAMESPACE}|default|g' \
+        -e 's|${SANDBOX_TEMPLATE_NAME}|python-sandbox-template|g' \
+        -e 's|${SANDBOX_WARMPOOL_NAME}|python-sandbox-pool|g' \
+        -e 's|replicas: 0|replicas: 1|' \
+  | kubectl apply -f -
 
 kubectl get pods -n default -w   # wait for python-sandbox-pool-xxx → 1/1
 ```
 
-Knobs, all in the Template or pool above — no image rebuild for any of
-them:
+Keep the names consistent: the pool's `sandboxTemplateRef` must match the
+template's name, and your client's warm-pool setting must match the pool's.
+Substituting a throwaway template name leaves an orphan template nothing
+references.
+
+Knobs, all by editing the Template or pool after applying — no image
+rebuild for any of them:
 
 - **`replicas`** on the warm pool — how many idle pods you keep. Costs
   their requests sitting idle; buys a much faster first command.
 - **`resources`** on the container — per-sandbox CPU/memory ceiling.
-- **`runtimeClassName: gvisor`** in `podTemplate.spec` — kernel-level
-  isolation between sandboxes rather than namespace-level. Install the
-  gVisor RuntimeClass on your cluster first.
+- **`runtimeClassName`** — upstream's template already carries commented
+  lines for `gvisor` and `kata-qemu`. Uncomment one for kernel-level
+  isolation between sandboxes rather than namespace-level, after installing
+  that RuntimeClass on your cluster.
 - **`volumeClaimTemplates`** — drop it for ephemeral sandboxes, or raise
   the size for heavier workloads.
 
