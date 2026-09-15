@@ -12,18 +12,20 @@ controller directly; there is no flag, no fallback, no dispatcher — this
 This doc is kept as the history of how that happened — Phase 1 (install +
 sanity-check agent-sandbox itself), Phase 2 A–G (harden it, adapt
 jarvis-backend, wire it in, benchmark it, GitOps it, cut traffic over, tear
-the old thing down, then close an auth regression the cutover introduced).
+the old thing down, then work out what the router can and cannot do about
+one conversation reaching another's sandbox).
 Read top to bottom for the story, or jump to
 [Phase 2 step F](#f-cutover--done-2026-09-14-jarvis-sandboxs-own-orchestrator-no-longer-exists)
 for what the actual cutover looked like and what got deleted, or
-[step G](#g-security-hardening--router--tokenreview-auth-done-2026-09-15-residual-gap-knowingly-accepted)
-for a known, user-accepted gap: direct sandbox-pod-to-sandbox-pod access
-is still unauthenticated (router auth only covers jarvis-backend's own
-traffic) — normal per-conversation usage is confirmed isolated, but a
-sandbox that's been made to run adversarial code could still reach another
-conversation's sandbox directly. For the practical "how is this actually
-deployed, what do I run to redo it", skip straight to
-[Current deployment](#current-deployment) below.
+[step G](#g-cross-conversation-access--what-was-found-what-the-router-can-and-cant-do-2026-09-15)
+for a known, user-accepted gap: one sandbox pod can still reach another's
+IP directly, and **no router configuration affects that** — it is traffic
+the router never sees. Normal per-conversation usage is isolated and
+verified; the exposure needs adversarial code running inside a sandbox.
+Step G is also where several confident-but-wrong conclusions got corrected,
+so read it before trusting anything earlier in this doc about router auth.
+For the practical "how is this actually deployed, what do I run to redo
+it", skip straight to [Current deployment](#current-deployment) below.
 
 > [DEPLOY-STANDALONE.md](DEPLOY-STANDALONE.md) is now **stale** — it was
 > written before this cutover for a different audience (deploying
@@ -180,14 +182,17 @@ subjects:
 ```
 
 This RBAC (unchanged since Phase 2 step F) covers jarvis-backend's direct
-k8s-API calls (create/list/get/delete on `sandboxclaims`/`sandboxes`). It
-now does double duty as router authentication too — see step G below —
-because jarvis-backend sends this same ServiceAccount's projected token as
-the bearer credential the router validates via TokenReview. No separate
-secret was provisioned for that; the router itself needs its own RBAC
-(`sandbox-router` ServiceAccount + Pod-read ClusterRole +
-`system:auth-delegator`), tracked in `jarvis-deploy`'s
-`agent-sandbox-router/` alongside its Deployment — see step G.
+k8s-API calls: create/list/get/delete on `sandboxclaims`, read on
+`sandboxes`. The `sandboxes` grant is load-bearing in a way that isn't
+obvious and shouldn't be trimmed as dead weight — the SDK reads
+`.status.podIPs` from the Sandbox to tell the router which pod to forward
+to (`X-Sandbox-Pod-IP`). Remove it and routing breaks, not just status
+reporting.
+
+The router needs no RBAC and no ServiceAccount of its own: it never calls
+the Kubernetes API, since the client hands it the pod IP. (An earlier
+version of this setup gave it both — see step G for why that turned out to
+be unnecessary.)
 
 **ServiceAccount wiring** — `jarvis-deploy/backend/base/backend.yaml`'s
 `template.spec.serviceAccountName: jarvis-backend` (GitOps'd like any other
@@ -195,10 +200,9 @@ Deployment field — no reason this one needs to be manual).
 
 **Code** — `jarvis-backend/app/agents/tools/sandbox_manager.py` is the
 entire client, no flag/dispatcher (removed once the old orchestrator was
-gone — see Phase 2 step F). Reversed once more on 2026-09-15, for security
-not convenience — see [step G](#g-security-hardening--router--tokenreview-auth-done-2026-09-15-residual-gap-knowingly-accepted)
-below for why it now goes through the router with a bearer token instead of
-straight to the pod. The shape any call site actually uses:
+gone — see Phase 2 step F). It goes **through the router**, not straight to
+a pod IP; see [step G](#g-cross-conversation-access--what-was-found-what-the-router-can-and-cant-do-2026-09-15)
+for why pod-direct is the thing to avoid. The shape any call site uses:
 
 ```python
 # app/agents/tools/sandbox_manager.py
@@ -206,11 +210,6 @@ from k8s_agent_sandbox import AsyncSandboxClient
 from k8s_agent_sandbox.models import SandboxDirectConnectionConfig
 
 _ROUTER_URL = "http://sandbox-router-svc.agent-sandbox-system.svc.cluster.local:8080"
-_SA_TOKEN_PATH = "/var/run/secrets/kubernetes.io/serviceaccount/token"
-
-def _auth_headers() -> dict[str, str]:
-    with open(_SA_TOKEN_PATH) as f:
-        return {"Authorization": f"Bearer {f.read().strip()}"}
 
 def init_client() -> None:
     global _client
@@ -220,9 +219,10 @@ def init_client() -> None:
 
 async def _get_or_create_sandbox(thread_id: str):
     ...  # claims by thread_id label, reuses if it exists
-    # no first-class SDK support for custom headers on this connection mode —
-    # sandbox.connector.client is a real, shared, settable httpx.AsyncClient
-    sandbox.connector.client.headers.update(_auth_headers())
+    # No credential is sent: the router runs ALLOW_UNAUTHENTICATED_ROUTER="true".
+    # To switch that off, inject the shared ROUTER_AUTH_TOKEN here —
+    # SandboxDirectConnectionConfig has no headers field, but
+    # sandbox.connector.client is a real, shared, settable httpx.AsyncClient.
     return sandbox
 
 async def exec_bash(thread_id: str, command: str) -> dict:
@@ -338,7 +338,9 @@ kubectl apply -f https://github.com/kubernetes-sigs/agent-sandbox/releases/downl
 kubectl -n agent-sandbox-system rollout status deployment/agent-sandbox-controller --timeout=90s
 
 # sandbox-router — routes client requests to the right Sandbox pod.
-# NOTE: disables router auth, local-test only — Phase 2 needs this on.
+# The second sed flips ALLOW_UNAUTHENTICATED_ROUTER to "true" (upstream's
+# file ships "false"). This is still what's deployed — see step G for the
+# trade-off and why it doesn't affect per-conversation isolation.
 curl -sSL https://raw.githubusercontent.com/kubernetes-sigs/agent-sandbox/refs/tags/${VERSION}/clients/python/agentic-sandbox-client/sandbox-router/sandbox_router.yaml \
   | sed 's|${ROUTER_IMAGE}|us-central1-docker.pkg.dev/k8s-staging-images/agent-sandbox/sandbox-router:latest-main|g' \
   | sed '/ALLOW_UNAUTHENTICATED_ROUTER/{n;s/value: "false"/value: "true"/}' \
@@ -970,7 +972,7 @@ with no way to verify anything about it from here. If staging is also
 moving off the old orchestrator, that's a separate decommission someone
 with visibility into that environment needs to do.
 
-### G. Security hardening — router + TokenReview auth (done, 2026-09-15); residual gap knowingly accepted
+### G. Cross-conversation access — what was found, what the router can and can't do (2026-09-15)
 
 **What was found.** The old (now-deleted) orchestrator authenticated every
 sandbox call with a per-pod `AGENT_TOKEN`, checked server-side by
@@ -1009,55 +1011,87 @@ this. The vulnerability is real but requires an adversarial payload
 running inside a sandbox (e.g. from a prompt injection in fetched content,
 or attacker-supplied code the model executes) — not baseline exposure.
 
-**Fix implemented**: agent-sandbox's `sandbox-router` has a full built-in
-authorization framework (`--authz-mode=allow-all|tokenreview|scoped-token`,
-see `sandbox-router`'s own README) that the cutover had simply bypassed.
-Rebuilt the router from the `v1.0.2` Go source (already vendored for the
-controller/CRDs) with `--authz-mode=tokenreview
---authz-tokenreview-require-token=true --cache-enabled=true` (the cache is
-what actually fixes the 502s the old staging image had, as a side
-benefit), GitOps'd in `jarvis-deploy/agent-sandbox-router/` (Deployment +
-kustomization + `argocd/agent-sandbox-router-application.yaml`), with its
-RBAC (`ServiceAccount sandbox-router` + Pod-read `ClusterRole` +
-`system:auth-delegator` `ClusterRoleBinding`, needed for the TokenReview
-API call itself) applied by hand the same way jarvis-backend's own RBAC
-is — a permission grant, deliberately not GitOps'd. `sandbox_manager.py`
-switched from `SandboxInClusterConnectionConfig` to
-`SandboxDirectConnectionConfig` pointed at the router's in-cluster
-Service, sending jarvis-backend's own projected ServiceAccount token
-(the one already granted `sandboxclaims`/`sandboxes` RBAC) as
-`Authorization: Bearer <token>` — no new secret, same identity doing
-double duty. See the [Current deployment](#current-deployment) section's
-jarvis-backend code block for the actual shape (`_auth_headers()`,
-`sandbox.connector.client.headers.update(...)` — no first-class SDK field
-for this on `SandboxDirectConnectionConfig`, so it reaches into the
-shared `httpx.AsyncClient` directly).
+**First fix attempt, since reverted**: agent-sandbox's `sandbox-router` has
+a built-in authorization framework
+(`--authz-mode=allow-all|tokenreview|scoped-token`) that the cutover had
+bypassed. The router was rebuilt from the `v1.0.2` Go source with
+`--authz-mode=tokenreview --authz-tokenreview-require-token=true
+--cache-enabled=true`, GitOps'd in `jarvis-deploy/agent-sandbox-router/`,
+with hand-applied RBAC (`ServiceAccount sandbox-router` + Pod-read
+`ClusterRole` + `system:auth-delegator`), and `sandbox_manager.py` switched
+to `SandboxDirectConnectionConfig` against the router's Service, sending
+jarvis-backend's projected ServiceAccount token as
+`Authorization: Bearer <token>`. Unauthenticated calls did start getting
+`401`, and the `bash` tool kept working.
 
-Verified live: unauthenticated calls to the router get `401`; the real
-`bash` tool, going through jarvis-backend's normal code path, still works.
+**What that was actually worth — much less than it looked (2026-09-15).**
+Two of the beliefs behind it were tested afterwards and both were wrong:
 
-**What this fix does *not* close, confirmed by re-running the exact same
-attack after the fix was live**: routing jarvis-backend's own traffic
-through an authenticated router does nothing to stop one sandbox pod from
-reaching another sandbox pod's raw IP directly — that traffic never
-touches the router, so TokenReview never sees it. The direct pod-to-pod
-compromise described above **still works, unchanged, after this fix**.
-Actually closing it needs one of: NetworkPolicy enforcement at the
-cluster/CNI level (this minikube setup doesn't have that today, and
-switching CNI is disruptive well beyond this migration's scope), or
-authentication added to the sandbox pods' own HTTP servers
-(`agentsandbox_server.py` and/or a fork of the stock template) — real
-work, not a config flag.
+- *"The published router image is an old Python build with no pod-IP cache,
+  so router mode 502s."* No. The 502s were misattributed. The SDK resolves
+  the pod IP **itself**, from the Sandbox CR's `.status.podIPs` (see
+  `async_sandbox.get_pod_ip` — it reads the *Sandbox*, so the existing
+  `sandboxes: get` grant suffices; no `pods` RBAC anywhere), and passes it
+  as `X-Sandbox-Pod-IP`. The router only forwards. That is why upstream's
+  own quickstart YAML ships no ServiceAccount at all. Verified by running
+  the published image and doing real exec + file I/O through it: clean,
+  no 502.
+- *"The published image has no authz at all."* No. It has
+  `ALLOW_UNAUTHENTICATED_ROUTER` plus a shared `ROUTER_AUTH_TOKEN`. Run
+  with the flag at upstream's own default of `"false"` and a Secret wired
+  in, an unauthenticated call gets a real `401`, while authenticated calls
+  work normally. Verified live.
 
-**Decision**: raised to the user 2026-09-15 along with the above tradeoffs.
-Explicit instruction received: leave it here — the legitimate-traffic path
-(jarvis-backend → router → pod) is authenticated, ordinary per-conversation
-usage is confirmed isolated, and the residual deliberate-attack vector
-(pod directly reaching another pod's IP) is a known, accepted risk, not
-scheduled for further work unless raised again. If revisiting this: the
-NetworkPolicy option is probably the smaller lift on a CNI that supports
-it (Cilium/Calico, not minikube's default), since it needs no image
-changes; the per-pod-auth option is more portable but means giving
-`agentsandbox_server.py` (and possibly forking the stock template image)
+And most importantly, **`tokenreview` never addressed cross-conversation
+access in the first place.** Upstream documents the scope plainly: it
+*authenticates* the caller — confirms the token belongs to some known
+cluster principal — and does **not** check whether that principal may
+touch the specific sandbox named in `X-Sandbox-ID`. jarvis-backend uses one
+ServiceAccount token for every conversation, so there was never anything
+there to tell conversations apart. The mode that does bind a credential to
+a single sandbox is `scoped-token`, which requires something to mint
+per-sandbox tokens at creation time (the router only verifies, never
+mints) — real integration work, not a flag.
+
+**Where it landed**: back on the published image with the quickstart's
+config (`ALLOW_UNAUTHENTICATED_ROUTER="true"`), no self-built image, no
+router ServiceAccount or RBAC, and `_auth_headers()` removed from
+`sandbox_manager.py`. The self-built router bought nothing this deployment
+needed, and cost a bespoke image to rebuild plus a `system:auth-delegator`
+grant. `SandboxDirectConnectionConfig` through the router stays — that part
+was right, and going pod-direct remains the thing to avoid.
+
+**What actually provides per-conversation isolation** — and always did,
+independent of every router decision above — is `_get_or_create_sandbox()`
+giving each `thread_id` its own claim, hence its own pod. Verified live
+through the published router with two conversations: different pods,
+different `hostname`s, and B could neither list nor `cat` a file A had
+written.
+
+**What no router setting closes**, confirmed by re-running the exact same
+attack while the authenticated router was live: one sandbox pod reaching
+another sandbox pod's raw IP never touches the router, so nothing the
+router does — TokenReview, a shared token, anything — can see it, let
+alone stop it. The direct pod-to-pod compromise works unchanged under
+every router configuration tried. Closing it needs one of: NetworkPolicy
+enforcement at the cluster/CNI level (this minikube setup doesn't have it,
+and switching CNI is disruptive well beyond this migration's scope), or
+authentication on the sandbox pods' own HTTP servers (`agentsandbox_server.py`
+and/or a fork of the stock template) — real work, not a config flag.
+
+**Decision**: raised to the user 2026-09-15 with the tradeoffs above.
+Explicit instruction: leave it here. Ordinary per-conversation usage is
+confirmed isolated, and the residual deliberate-attack vector (a pod
+reaching another pod's IP) is a known, accepted risk, not scheduled for
+further work unless raised again. Scope was set explicitly at the FE → BE →
+sandbox chat path.
+
+If revisiting: NetworkPolicy is probably the smaller lift on a CNI that
+supports it (Cilium/Calico, not minikube's default), since it needs no
+image changes. Per-pod auth is more portable but means giving
+`agentsandbox_server.py` (and possibly a fork of the stock template image)
 its own token check again — effectively re-adding a scoped version of what
-the old orchestrator's `verify_agent_token` did.
+the old orchestrator's `verify_agent_token` did. `scoped-token` on the Go
+router is the third option, and the only one that makes the *router* aware
+of which sandbox a caller may touch; it needs a minting component, and it
+means going back to a self-built router image.
