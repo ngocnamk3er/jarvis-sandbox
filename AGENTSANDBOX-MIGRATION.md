@@ -27,11 +27,10 @@ so read it before trusting anything earlier in this doc about router auth.
 For the practical "how is this actually deployed, what do I run to redo
 it", skip straight to [Current deployment](#current-deployment) below.
 
-> [DEPLOY-STANDALONE.md](DEPLOY-STANDALONE.md) is now **stale** — it was
-> written before this cutover for a different audience (deploying
-> jarvis-sandbox's own orchestrator behind a *different* chatbot) and still
-> frames that orchestrator as "the current system". Not rewritten yet;
-> until it is, this doc is the accurate one.
+> [DEPLOY-STANDALONE.md](DEPLOY-STANDALONE.md) covers the same ground for a
+> *different* chatbot on a cluster that has none of this yet — rewritten
+> 2026-09-15 around agent-sandbox, after the cutover left it describing an
+> orchestrator that no longer exists.
 
 ## Current deployment
 

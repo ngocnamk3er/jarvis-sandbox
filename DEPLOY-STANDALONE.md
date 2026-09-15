@@ -1,323 +1,393 @@
-# Deploying jarvis-sandbox for a different chatbot
+# Giving a chatbot code-execution sandboxes
 
-A from-zero guide for running jarvis-sandbox as the code-execution sandbox
-behind **any** chatbot backend, not just jarvis-backend — for example, an
-existing chatbot at your company that doesn't have a sandbox yet. Every
-manifest here is self-contained (no dependency on the `jarvis-deploy` repo
-or this workspace's home-lab GitLab/minikube setup) — swap in your own
-registry and cluster.
+A from-zero guide for putting per-conversation sandboxes behind **any**
+chatbot backend, not just jarvis-backend. Nothing here depends on the
+`jarvis-deploy` repo or this workspace's home-lab setup — swap in your own
+cluster and registry.
 
-For *why* it's built this way (pod-per-conversation, no in-pod jail,
-NetworkPolicy egress lockdown, etc.), see [README.md](README.md)'s "Theory"
-section — this guide is action-only.
+> **If you came here looking for jarvis-sandbox's orchestrator, it is
+> gone.** This repo used to ship a Deployment that mapped
+> `thread_id → pod`, created agent pods itself, and exposed
+> `/api/v1/sandbox/exec` behind an `X-Internal-Api-Key` header. That was
+> decommissioned on 2026-09-14 and its code deleted; the same job is now
+> done by [kubernetes-sigs/agent-sandbox](https://agent-sandbox.sigs.k8s.io/docs/),
+> an upstream project. See [AGENTSANDBOX-MIGRATION.md](AGENTSANDBOX-MIGRATION.md)
+> for that history.
 
-## Architecture, in one paragraph
+## What you actually deploy
 
-One image, two roles. The **orchestrator** is a single Deployment your
-chatbot backend calls over HTTP; it maps `thread_id → pod`, creating one
-disposable **agent** pod per conversation on demand and proxying commands to
-it. Your chatbot never talks to agent pods directly — only to the
-orchestrator's Service, with a shared secret header.
+Three upstream pieces, all from **published images — nothing to build**:
+
+| Piece | Role |
+|---|---|
+| agent-sandbox **controller + CRDs** | Creates and tracks sandbox pods |
+| **sandbox-router** | Proxies your backend's commands to the right pod |
+| **SandboxTemplate + SandboxWarmPool** | What a sandbox pod looks like; how many stay pre-warmed |
+
+Your backend then talks to the router using the `k8s-agent-sandbox` Python
+SDK.
+
+**What this repo still contributes is optional**: a richer runtime image
+(pandas, numpy, matplotlib, python-docx, pandoc) you can swap in place of
+upstream's stock Python sandbox. Skip [Step 6](#step-6--optional-a-richer-runtime-image)
+and you never build anything at all.
+
+## How isolation works
+
+Worth understanding before you rely on it:
+
+- **One conversation, one pod.** Your backend labels each `SandboxClaim`
+  with its conversation ID and looks it up by that label. Same ID finds the
+  same pod with its files intact; a new ID gets a fresh pod. This is
+  something *your code* does — nothing in the cluster does it for you.
+- **Sandbox pods authenticate nothing.** Anything that can reach a pod's
+  IP can run commands in it. Upstream's model puts the boundary at the
+  router plus NetworkPolicy, not at the pod.
+- **So NetworkPolicy matters here**, and only works if your CNI enforces
+  it (Calico, Cilium, most managed clusters). Without enforcement, one
+  sandbox can reach another sandbox's IP directly and read or execute
+  anything in it — confirmed exploitable, not theoretical. Check before
+  assuming you have isolation.
 
 ## Prerequisites
 
-- A Kubernetes cluster (1.24+), any distro — managed (EKS/GKE/AKS) or
-  self-hosted, `kubectl` pointed at it with permission to create
-  Deployments/Services/RBAC/NetworkPolicies in one namespace.
-- A container registry your cluster's nodes can pull from, and that you can
-  `docker push` to.
-- Docker (or another OCI builder) locally, to build the image.
-- *Recommended, not required:* a NetworkPolicy-enforcing CNI (Calico,
-  Cilium, most managed clusters' default CNI already does). Without one the
-  egress-lockdown policy below is accepted by the API server but not
-  enforced — sandboxes still work, just without that isolation layer until
-  you add one.
+- A Kubernetes cluster (1.24+), any distro, with `kubectl` and permission
+  to create CRDs, Deployments, RBAC and cluster-scoped resources.
+- Your chatbot backend running in that cluster (or able to reach it).
+- *Strongly recommended:* a NetworkPolicy-enforcing CNI — see above.
+- Docker only if you want [Step 6](#step-6--optional-a-richer-runtime-image).
 
-## Step 1 — Get the code
+## Step 1 — Controller + CRDs
 
 ```bash
-git clone <this-repo-url> jarvis-sandbox
-cd jarvis-sandbox
+VERSION=v1.0.2
+
+kubectl apply -f https://github.com/kubernetes-sigs/agent-sandbox/releases/download/${VERSION}/sandbox.yaml
+kubectl apply -f https://github.com/kubernetes-sigs/agent-sandbox/releases/download/${VERSION}/extensions.yaml
+
+kubectl -n agent-sandbox-system rollout status deployment/agent-sandbox-controller --timeout=90s
 ```
 
-## Step 2 — Build & push the image
+Four CRDs land. Note the split in API groups — it matters for RBAC in
+Step 4 and a wrong group applies cleanly, then fails only at runtime:
+
+| CRD | API group |
+|---|---|
+| `sandboxes` | `agents.x-k8s.io` |
+| `sandboxclaims`, `sandboxtemplates`, `sandboxwarmpools` | `extensions.agents.x-k8s.io` |
+
+## Step 2 — Router
+
+Upstream's quickstart manifest, unmodified apart from the image and one
+flag:
 
 ```bash
-REGISTRY=your-registry.example.com/your-org   # <- change this
-TAG=$(git rev-parse --short HEAD)
+VERSION=v1.0.2
 
-# --provenance=false avoids an OCI-manifest-list some registries mishandle
-# (multiple registries were observed rejecting cross-repo blob mounts or
-# denying pulls of a provenance-attested manifest — cheap to always pass).
-docker build --provenance=false -t ${REGISTRY}/jarvis-sandbox:${TAG} .
-docker push ${REGISTRY}/jarvis-sandbox:${TAG}
+curl -sSL https://raw.githubusercontent.com/kubernetes-sigs/agent-sandbox/refs/tags/${VERSION}/clients/python/agentic-sandbox-client/sandbox-router/sandbox_router.yaml \
+  | sed 's|${ROUTER_IMAGE}|us-central1-docker.pkg.dev/k8s-staging-images/agent-sandbox/sandbox-router:latest-main|g' \
+  | sed '/ALLOW_UNAUTHENTICATED_ROUTER/{n;s/value: "false"/value: "true"/}' \
+  | kubectl -n agent-sandbox-system apply -f -
+
+kubectl -n agent-sandbox-system rollout status deployment/sandbox-router-deployment --timeout=90s
 ```
 
-One image serves both roles — `SANDBOX_ROLE` (env var, set below) picks
-which one a given pod runs. The orchestrator creates agent pods reading
-**its own** running image off the k8s API (`SANDBOX_IMAGE` left empty), so
-you only ever push/reference this one tag, never two.
+This creates `sandbox-router-deployment` and the `sandbox-router-svc`
+Service your backend will call. It needs **no ServiceAccount and no RBAC** —
+the router never calls the Kubernetes API, because the SDK resolves the pod
+IP itself and hands it over in a header.
 
-## Step 3 — Namespace + secret
+### About that second `sed`
+
+It flips `ALLOW_UNAUTHENTICATED_ROUTER` from upstream's default of
+`"false"` to `"true"`, so you don't have to provision a Secret. Decide
+deliberately:
+
+| Setting | Effect | Cost |
+|---|---|---|
+| `"true"` | Any workload that can reach the Service can address any sandbox | none |
+| `"false"` | Callers with no credential get `401` | A Secret, uncommenting the `ROUTER_AUTH_TOKEN` env block, and sending `Authorization: Bearer <token>` from your backend |
+
+**Per-conversation isolation does not depend on this flag** — that comes
+from the label lookup in Step 5. What `"false"` buys is narrower than it
+sounds: it rejects callers holding no token. It does *not* restrict a
+caller to one specific sandbox. If you need that, the router's
+`--authz-mode=scoped-token` is the only mode that binds a credential to a
+single sandbox, and it requires a component that mints per-sandbox tokens
+plus building the router from source.
+
+## Step 3 — Template + warm pool
+
+Upstream's stock runtime image. The warm pool keeps pods pre-started so a
+conversation's first command doesn't pay pod startup.
 
 ```bash
-NAMESPACE=jarvis-sandbox   # <- pick any namespace; used throughout below
-kubectl create namespace ${NAMESPACE}
-
-# Shared secret between your chatbot backend and the orchestrator — your
-# backend sends this back on every call as X-Internal-Api-Key.
-kubectl create secret generic jarvis-secrets -n ${NAMESPACE} \
-  --from-literal=INTERNAL_API_KEY=$(openssl rand -hex 32)
-```
-
-Keep the generated key — your chatbot backend needs the same value (Step 6).
-
-## Step 4 — Apply the manifests
-
-Everything below is one `kubectl apply -f -`. Replace `${REGISTRY}`,
-`${TAG}`, `${NAMESPACE}` first (or `envsubst` it).
-
-```yaml
-apiVersion: v1
-kind: ConfigMap
+kubectl apply -f - <<'EOF'
+apiVersion: extensions.agents.x-k8s.io/v1beta1
+kind: SandboxTemplate
 metadata:
-  name: sandbox-config
-  namespace: ${NAMESPACE}
-data:
-  # Consumed by the ORCHESTRATOR only. Agent pods get their env from the pod
-  # spec the orchestrator writes (app/orchestrator/podspec.py), derived from
-  # these same values — one source of truth, no drift between the two.
-  SANDBOX_ROLE: "orchestrator"
-  APP_NAME: "Jarvis Sandbox"
-  API_PREFIX: "/api/v1"
-  POOL_SIZE: "0"              # 0 = pure on-demand, no idle pods kept warm
-  MAX_SANDBOXES: "6"          # hard ceiling on total agent pods (past it -> 503)
-  IDLE_GC_MINUTES: "30"       # reap a sandbox no exec call touched for this long
-  SANDBOX_TTL_MINUTES: "180"  # hard per-pod lifetime, even if still active
-  CLAIM_TIMEOUT_SECONDS: "40"
-  COMMAND_TIMEOUT_SECONDS: "300"
-  SANDBOX_CPU_REQUEST: "100m"
-  SANDBOX_CPU_LIMIT: "2"
-  SANDBOX_MEM_REQUEST: "256Mi"
-  SANDBOX_MEM_LIMIT: "2Gi"
-  SANDBOX_WORKSPACE_SIZE: "2Gi"
-  SANDBOX_TMP_SIZE: "1Gi"
-  SANDBOX_RUNTIME_CLASS: ""   # set to "gvisor" once that RuntimeClass exists on your cluster
+  name: python-sandbox-template
+  namespace: default
+spec:
+  podTemplate:
+    spec:
+      containers:
+      - name: python-runtime
+        image: us-central1-docker.pkg.dev/k8s-staging-images/agent-sandbox/python-runtime-sandbox:latest-main
+        ports:
+        - containerPort: 8888
+        readinessProbe:
+          httpGet: {path: "/", port: 8888}
+          initialDelaySeconds: 0
+          periodSeconds: 1
+        livenessProbe:
+          httpGet: {path: "/", port: 8888}
+          initialDelaySeconds: 2
+          periodSeconds: 10
+        resources:
+          requests: {cpu: "250m", memory: "512Mi", ephemeral-storage: "512Mi"}
+      restartPolicy: OnFailure
+  volumeClaimTemplates:
+  - metadata: {name: workspace}
+    spec:
+      accessModes: ["ReadWriteOnce"]
+      resources: {requests: {storage: "1Gi"}}
+  volumeClaimTemplatesPolicy: Overrides
 ---
-apiVersion: v1
-kind: ServiceAccount
+apiVersion: extensions.agents.x-k8s.io/v1beta1
+kind: SandboxWarmPool
 metadata:
-  name: jarvis-sandbox-orchestrator
-  namespace: ${NAMESPACE}
----
+  name: python-sandbox-pool
+  namespace: default
+spec:
+  replicas: 1
+  sandboxTemplateRef:
+    name: python-sandbox-template
+EOF
+
+kubectl get pods -n default -w   # wait for python-sandbox-pool-xxx → 1/1
+```
+
+Knobs, all in the Template or pool above — no image rebuild for any of
+them:
+
+- **`replicas`** on the warm pool — how many idle pods you keep. Costs
+  their requests sitting idle; buys a much faster first command.
+- **`resources`** on the container — per-sandbox CPU/memory ceiling.
+- **`runtimeClassName: gvisor`** in `podTemplate.spec` — kernel-level
+  isolation between sandboxes rather than namespace-level. Install the
+  gVisor RuntimeClass on your cluster first.
+- **`volumeClaimTemplates`** — drop it for ephemeral sandboxes, or raise
+  the size for heavier workloads.
+
+The controller also stamps `networkPolicyManagement: Managed` on the
+Template and creates a NetworkPolicy per template. On a cluster whose CNI
+doesn't enforce NetworkPolicy the object exists and does nothing — its
+presence is not evidence of isolation.
+
+## Step 4 — RBAC for your backend
+
+Unlike the router, **your backend does need permissions** — it is the thing
+calling the Kubernetes API. Replace the ServiceAccount name and namespace
+with your chatbot's:
+
+```bash
+kubectl apply -f - <<'EOF'
 apiVersion: rbac.authorization.k8s.io/v1
 kind: Role
 metadata:
-  name: jarvis-sandbox-orchestrator
-  namespace: ${NAMESPACE}
+  name: chatbot-agentsandbox
+  namespace: default          # where sandboxes live
 rules:
-  - apiGroups: [""]
-    resources: ["pods"]
-    verbs: ["get", "list", "watch", "create", "delete", "patch"]
+  - apiGroups: ["extensions.agents.x-k8s.io"]
+    resources: ["sandboxclaims"]
+    verbs: ["get", "list", "watch", "create", "delete"]
+  - apiGroups: ["agents.x-k8s.io"]
+    resources: ["sandboxes"]
+    verbs: ["get", "list", "watch"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding
 metadata:
-  name: jarvis-sandbox-orchestrator
-  namespace: ${NAMESPACE}
-roleRef:
-  apiGroup: rbac.authorization.k8s.io
-  kind: Role
-  name: jarvis-sandbox-orchestrator
+  name: chatbot-agentsandbox
+  namespace: default
+roleRef: {apiGroup: rbac.authorization.k8s.io, kind: Role, name: chatbot-agentsandbox}
 subjects:
-  - kind: ServiceAccount
-    name: jarvis-sandbox-orchestrator
-    namespace: ${NAMESPACE}
----
-apiVersion: apps/v1
-kind: Deployment
-metadata:
-  name: sandbox
-  namespace: ${NAMESPACE}
-spec:
-  replicas: 1
-  strategy:
-    type: Recreate   # exactly one orchestrator — two would race on the pool
-  selector:
-    matchLabels: {app: sandbox}
-  template:
-    metadata:
-      labels: {app: sandbox}
-    spec:
-      serviceAccountName: jarvis-sandbox-orchestrator
-      securityContext:
-        runAsNonRoot: true
-        runAsUser: 1000
-        seccompProfile: {type: RuntimeDefault}
-      containers:
-        - name: orchestrator
-          image: ${REGISTRY}/jarvis-sandbox:${TAG}
-          imagePullPolicy: IfNotPresent
-          securityContext:
-            allowPrivilegeEscalation: false
-            capabilities: {drop: ["ALL"]}
-          env:
-            - name: POD_NAMESPACE
-              valueFrom: {fieldRef: {fieldPath: metadata.namespace}}
-          envFrom:
-            - configMapRef: {name: sandbox-config}
-            - secretRef: {name: jarvis-secrets}
-          ports: [{containerPort: 8000}]
-          resources:
-            requests: {cpu: "50m", memory: "128Mi"}
-            limits: {cpu: "500m", memory: "512Mi"}
-          readinessProbe:
-            httpGet: {path: /api/v1/health, port: 8000}
-            initialDelaySeconds: 3
-            periodSeconds: 10
-          livenessProbe:
-            httpGet: {path: /api/v1/health, port: 8000}
-            initialDelaySeconds: 10
-            periodSeconds: 20
----
-apiVersion: v1
-kind: Service
-metadata:
-  name: sandbox
-  namespace: ${NAMESPACE}
-spec:
-  selector: {app: sandbox}
-  ports: [{port: 8000, targetPort: 8000}]
----
-# Locks down the per-conversation agent pods: default-deny both directions,
-# two narrow holes — ingress only from the orchestrator, egress only DNS.
-# Needs a NetworkPolicy-enforcing CNI (see Prerequisites); inert otherwise.
-apiVersion: networking.k8s.io/v1
-kind: NetworkPolicy
-metadata:
-  name: sandbox-agent
-  namespace: ${NAMESPACE}
-spec:
-  podSelector:
-    matchLabels: {app: jarvis-sandbox-agent}
-  policyTypes: [Ingress, Egress]
-  ingress:
-    - from: [{podSelector: {matchLabels: {app: sandbox}}}]
-      ports: [{protocol: TCP, port: 8000}]
-  egress:
-    - to: [{namespaceSelector: {}, podSelector: {matchLabels: {k8s-app: kube-dns}}}]
-      ports: [{protocol: UDP, port: 53}, {protocol: TCP, port: 53}]
+  - {kind: ServiceAccount, name: YOUR-BACKEND-SA, namespace: YOUR-BACKEND-NS}
+EOF
 ```
+
+Then verify, because `kubectl apply` accepts a wrong API group silently:
 
 ```bash
-kubectl -n ${NAMESPACE} rollout status deploy/sandbox
+kubectl auth can-i get sandboxes        --as=system:serviceaccount:YOUR-BACKEND-NS:YOUR-BACKEND-SA -n default
+kubectl auth can-i create sandboxclaims --as=system:serviceaccount:YOUR-BACKEND-NS:YOUR-BACKEND-SA -n default
 ```
 
-## Step 5 — Verify
+Both grants are load-bearing, and the second one is easy to mistake for
+decoration. Tested by removing each:
 
-```bash
-kubectl -n ${NAMESPACE} port-forward svc/sandbox 18080:8000 &
-KEY=$(kubectl -n ${NAMESPACE} get secret jarvis-secrets -o jsonpath='{.data.INTERNAL_API_KEY}' | base64 -d)
+| Missing | Symptom |
+|---|---|
+| The whole binding | `403 Forbidden` on the first call |
+| `sandboxes` read only | **Every command returns `502`** — the SDK reads `.status.podIPs` from the Sandbox to tell the router where to forward |
 
-curl -s localhost:18080/api/v1/health
-curl -s localhost:18080/api/v1/sandbox/exec -H "X-Internal-Api-Key: $KEY" \
-  -H content-type:application/json \
-  -d '{"thread_id":"smoke-test","command":"python3 -c \"print(6*7)\" && whoami"}'
-# -> {"stdout":"42\nsandboxuser\n","stderr":"","exit_code":0,"timed_out":false}
+## Step 5 — Wire it into your chatbot
 
-curl -s -X POST localhost:18080/api/v1/sandbox/reset -H "X-Internal-Api-Key: $KEY" \
-  -H content-type:application/json -d '{"thread_id":"smoke-test"}'
+```
+pip install 'k8s-agent-sandbox[async]==1.0.2'
 ```
 
-If `exec` hangs or 502s, check `kubectl -n ${NAMESPACE} get pods` — the
-first call creates an agent pod from scratch (~3–5s); a pod stuck in
-`ImagePullBackOff` means the cluster's nodes can't reach your registry (see
-Troubleshooting).
-
-## Step 6 — Wire it into your chatbot backend
-
-Three routes, all behind `X-Internal-Api-Key: <the secret from Step 3>`.
-Point your chatbot's HTTP client at `http://sandbox.${NAMESPACE}.svc.cluster.local:8000`
-(in-cluster DNS) if the chatbot backend runs in the same cluster — otherwise
-expose the Service via Ingress/LoadBalancer and use that instead.
-
-| route | when to call it | request | response |
-|---|---|---|---|
-| `POST /api/v1/sandbox/exec` | your "run bash/code" tool | `{"thread_id": "<conversation id>", "command": "<shell command>", "timeout_seconds": 300}` | `{"stdout": "...", "stderr": "...", "exit_code": 0, "timed_out": false}` |
-| `GET /api/v1/sandbox/read?thread_id=&name=` | serving a file the sandbox generated | — | raw file bytes, `Content-Disposition` set |
-| `POST /api/v1/sandbox/reset` | conversation ends / user stops it | `{"thread_id": "<conversation id>"}` | `{"ok": true}` |
-
-`thread_id` is just your conversation/session ID — any stable string per
-conversation. Same `thread_id` across calls reuses the same pod (and its
-`/workspace` files); a new `thread_id` gets a fresh pod. Error codes worth
-handling explicitly: `503` (at `MAX_SANDBOXES` capacity — retry later),
-`504` (pod didn't become Ready within `CLAIM_TIMEOUT_SECONDS`), `502`
-(agent pod unreachable — orchestrator will create a new one on the next
-call).
-
-Minimal Python client (adapt to whatever your chatbot's tool-calling layer
-looks like):
+The whole integration. `thread_id` is your conversation/session ID — any
+stable string:
 
 ```python
-import httpx
+import re
+import shlex
 
-SANDBOX_URL = "http://sandbox.jarvis-sandbox.svc.cluster.local:8000/api/v1"
-INTERNAL_API_KEY = "..."  # same value as the jarvis-secrets Secret
+from k8s_agent_sandbox import AsyncSandboxClient
+from k8s_agent_sandbox.exceptions import SandboxRequestError
+from k8s_agent_sandbox.models import SandboxDirectConnectionConfig
 
-async def run_bash(thread_id: str, command: str, timeout: int = 300) -> dict:
-    async with httpx.AsyncClient(timeout=timeout + 30) as client:
-        resp = await client.post(
-            f"{SANDBOX_URL}/sandbox/exec",
-            json={"thread_id": thread_id, "command": command, "timeout_seconds": timeout},
-            headers={"X-Internal-Api-Key": INTERNAL_API_KEY},
-        )
-        resp.raise_for_status()
-        return resp.json()  # {stdout, stderr, exit_code, timed_out}
+ROUTER = "http://sandbox-router-svc.agent-sandbox-system.svc.cluster.local:8080"
+NAMESPACE = "default"
+WARMPOOL = "python-sandbox-pool"
+THREAD_LABEL = "chatbot-thread"
+
+client = AsyncSandboxClient(
+    # Through the router. Never point this at a pod IP directly — pods
+    # authenticate nothing, so pod-direct traffic bypasses the only
+    # checkpoint that exists.
+    connection_config=SandboxDirectConnectionConfig(api_url=ROUTER, server_port=8888),
+)
+
+
+def _label(thread_id: str) -> str:
+    """Label values are <=63 chars from a restricted charset."""
+    safe = re.sub(r"[^A-Za-z0-9_.-]", "-", thread_id)[:63]
+    return safe.strip("-_.") or "unknown"
+
+
+async def _sandbox_for(thread_id: str):
+    """One pod per conversation — this lookup IS the isolation mechanism."""
+    label = _label(thread_id)
+    existing = await client.list_all_sandboxes(NAMESPACE, label_selector=f"{THREAD_LABEL}={label}")
+    if existing:
+        return await client.get_sandbox(existing[0], NAMESPACE)
+    return await client.create_sandbox(
+        warmpool=WARMPOOL,
+        namespace=NAMESPACE,
+        sandbox_ready_timeout=180,
+        labels={THREAD_LABEL: label},
+    )
+
+
+async def run_bash(thread_id: str, command: str) -> dict:
+    sandbox = await _sandbox_for(thread_id)
+    # Upstream's stock image runs commands through shlex.split() + subprocess
+    # with no shell, so &&, |, > and heredocs all misbehave. Wrapping makes
+    # that split yield ['bash', '-c', '<command>'] so bash parses the rest.
+    try:
+        result = await sandbox.commands.run("bash -c " + shlex.quote(command), timeout=300)
+    except SandboxRequestError as e:
+        return {"error": str(e), "status": e.status_code}
+    return {"stdout": result.stdout, "stderr": result.stderr, "exit_code": result.exit_code}
+
+
+async def read_file(thread_id: str, name: str) -> bytes:
+    sandbox = await _sandbox_for(thread_id)
+    return await sandbox.files.read(name)
+
+
+async def reset(thread_id: str) -> None:
+    """Call when a conversation ends — otherwise pods accumulate."""
+    label = _label(thread_id)
+    for claim in await client.list_all_sandboxes(NAMESPACE, label_selector=f"{THREAD_LABEL}={label}"):
+        await client.delete_sandbox(claim, NAMESPACE)
 ```
 
-## Tuning for your own scale
+Two things that catch people out:
 
-All in the `sandbox-config` ConfigMap, edit and re-apply (no image rebuild
-needed):
+- **Catch `SandboxRequestError`, not `httpx.HTTPError`.** The SDK uses
+  `httpx` internally but wraps every non-2xx in its own type, carrying
+  `.status_code`. Code catching the httpx types never matches.
+- **Don't assume a working directory.** The stock image has no
+  `/workspace`; commands land wherever the image puts them. Use relative
+  paths.
 
-- `MAX_SANDBOXES` — hard ceiling on concurrent agent pods. Set based on
-  node capacity (`SANDBOX_MEM_LIMIT` × `MAX_SANDBOXES` should fit
-  comfortably under what your nodes provide).
-- `POOL_SIZE` — set above `0` to keep N pods pre-warmed if the ~3–5s
-  first-call cold start matters for your chatbot's UX; costs `POOL_SIZE ×
-  SANDBOX_MEM_REQUEST` sitting idle at all times.
-- `SANDBOX_TTL_MINUTES` / `IDLE_GC_MINUTES` — lower these for a
-  higher-turnover chatbot (frees pods faster) or raise for long-running
-  conversations that shouldn't lose their `/workspace` mid-session.
-- `SANDBOX_RUNTIME_CLASS: "gvisor"` — if you want kernel-level isolation
-  between sandboxes (not just namespaces), install the gVisor RuntimeClass
-  on your cluster first, then set this.
+## Step 6 — *(optional)* a richer runtime image
 
-The baked-in toolchain (pandas, matplotlib, python-docx, pandoc, etc. — see
-[README.md](README.md#the-image)) is fixed at build time; to add a library,
-add it to `Dockerfile` and rebuild/repush (Step 2), then roll the
-Deployment.
+Upstream's stock sandbox is a plain Python runtime. If your chatbot
+generates documents or charts, this repo's image adds pandas, numpy,
+matplotlib, python-docx and pandoc, speaking the same wire protocol
+(`GET /`, `POST /execute`, `POST /upload`, `GET /download/<path>` on
+port 8888).
+
+```bash
+git clone <this-repo-url> jarvis-sandbox && cd jarvis-sandbox
+
+# The toolchain base. --provenance=false avoids an OCI manifest-list some
+# registries mishandle — cheap to always pass.
+docker build --provenance=false -t ${REGISTRY}/sandbox-base:${TAG} .
+
+# Thin layer swapping in the agent-sandbox-compatible server.
+docker build --provenance=false -f Dockerfile.agentsandbox \
+  --build-arg BASE_IMAGE=${REGISTRY}/sandbox-base:${TAG} \
+  -t ${REGISTRY}/sandbox-runtime:${TAG} .
+
+docker push ${REGISTRY}/sandbox-runtime:${TAG}
+```
+
+Then point the Template's `image:` at it and re-apply Step 3. Nothing else
+changes — same protocol, same port, same client code.
+
+## Verify
+
+```bash
+kubectl get pods -n agent-sandbox-system   # controller + router Running
+kubectl get sandboxwarmpool -n default     # READY matches DESIRED
+```
+
+Then, from your backend, prove the property that actually matters — two
+different `thread_id`s must not see each other's files:
+
+```python
+await run_bash("conv-A", "echo 'private to A' > a.txt")
+print(await run_bash("conv-A", "ls"))            # includes a.txt
+print(await run_bash("conv-B", "ls"))            # must NOT include a.txt
+print(await run_bash("conv-B", "cat a.txt"))     # must fail: No such file
+print(await run_bash("conv-A", "cat a.txt"))     # reattaches: private to A
+```
+
+Leftover claims each hold a pod, so check after failed runs:
+
+```bash
+kubectl get sandboxclaim -n default
+```
 
 ## Troubleshooting
 
-- **`ImagePullBackOff` on the `sandbox` pod.** Nodes can't reach
-  `${REGISTRY}`. If your cluster is local (minikube/kind), skip the
-  registry entirely: `docker build ... -t jarvis-sandbox:local . && minikube
-  image load jarvis-sandbox:local`, then reference `jarvis-sandbox:local` in
-  the Deployment instead of a registry path.
-- **Pull works manually (`docker pull`) but the cluster still gets `denied:
-  access forbidden`.** Seen against more than one registry, root cause
-  never pinned down (looked like a registry-side quirk on certain
-  pushes, not a credentials problem — manual JWT replay of the exact same
-  auth → manifest → blob sequence succeeded every time). If it recurs:
-  `docker pull ${REGISTRY}/jarvis-sandbox:${TAG}` locally, retag to
-  whatever name your cluster's nodes resolve for that registry, and
-  `minikube image load` (or your cluster's equivalent local-image-load path)
-  as a bypass — this is a registry pull-path issue, not a bug in the image.
-- **NetworkPolicy applied but agent pods can still reach the internet.**
-  Your CNI isn't enforcing NetworkPolicy (default on some clusters/plugins).
-  Confirm with `kubectl exec` into an agent pod and `curl` something
-  external — if it succeeds, switch/enable a NetworkPolicy-enforcing CNI.
-- **`exec` returns 503 immediately.** At `MAX_SANDBOXES`; either raise the
-  ConfigMap value or your chatbot is leaking sandboxes — check it's calling
-  `/sandbox/reset` when conversations actually end.
+- **Every command returns `502`.** The router can't reach the pod. Check
+  the Sandbox has `.status.podIPs` populated, and that your backend's
+  ServiceAccount can read `sandboxes` — missing that grant produces exactly
+  this, since the SDK is what supplies the pod IP.
+- **`&&`, pipes or heredocs behave strangely.** The `bash -c` wrapping in
+  `run_bash` is missing. The stock image has no shell in the loop.
+- **A `502` reported as a timeout.** If you collapse every
+  `SandboxRequestError` into a timeout result, a routing or permission
+  failure will surface as "command timed out" and send you debugging the
+  wrong thing. Branch on `e.status_code`.
+- **`ImagePullBackOff` on sandbox pods.** Nodes can't reach your registry.
+  On a local cluster, skip it: build with a local tag and
+  `minikube image load` (or your cluster's equivalent).
+- **Pull works via `docker pull` but the cluster gets `denied: access
+  forbidden`.** Seen against more than one registry; root cause never
+  pinned down, and it looked registry-side rather than credential-related.
+  Workaround: pull locally, retag to whatever name your nodes resolve, and
+  load the image into the cluster directly.
+- **Sandboxes can still reach the internet, or each other, despite a
+  NetworkPolicy.** Your CNI isn't enforcing NetworkPolicy. Confirm by
+  `kubectl exec`ing into a sandbox and curling something external — if it
+  works, the policy is inert and you do not have network isolation.
+- **Pods accumulate.** Your backend isn't calling `reset()` when
+  conversations end.
